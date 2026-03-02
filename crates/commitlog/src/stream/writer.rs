@@ -13,8 +13,8 @@ use tokio::{
 use crate::{
     commit, error,
     index::IndexFile,
-    repo::{fallocate, Repo, SegmentLen as _},
-    segment::{self, FileLike, OffsetIndexWriter, CHECKSUM_LEN, DEFAULT_CHECKSUM_ALGORITHM},
+    repo::{fallocate, Repo, SegmentLen as _, SegmentWriter as _},
+    segment::{self, OffsetIndexWriter, CHECKSUM_LEN, DEFAULT_CHECKSUM_ALGORITHM},
     stream::common::{read_exact, AsyncFsync},
     Options, StoredCommit, DEFAULT_LOG_FORMAT_VERSION,
 };
@@ -126,13 +126,11 @@ where
                 OnTrailingData::Trim => {
                     info!("trimming segment {last} after invalid commit: {sofar:?}");
                     if let Some(idx) = offset_index.as_mut().map(IndexFile::as_mut) {
-                        idx.ftruncate(sofar.tx_range.end, sofar.size_in_bytes)
-                            .inspect_err(|e| {
-                                error!(
-                                    "failed to truncate offset index for segment {last} containing trailing data: {e}"
-                                )
-                            })?;
-                        segment.ftruncate(sofar.tx_range.end, sofar.size_in_bytes)?;
+                        idx.truncate(sofar.tx_range.end).map_err(|e| {
+                            error!("failed to truncate offset index for segment {last} containing trailing data: {e}");
+                            io::Error::other(e)
+                        })?;
+                        segment.ftruncate(sofar.size_in_bytes)?;
                         segment.seek(io::SeekFrom::End(0))?;
                     }
                     sofar
@@ -419,7 +417,7 @@ impl<W: AsyncWriteExt + AsyncFsync + Unpin> CurrentSegment<W> {
         if let Some(mut index) = self.offset_index.take() {
             let index = spawn_blocking(move || {
                 index
-                    .fsync()
+                    .flush()
                     .inspect_err(|e| warn!("offset index fsync failed: {e}"))
                     .ok();
                 index
@@ -455,7 +453,7 @@ fn create_segment<R: Repo>(
             trace!("segment len: {len}");
             if len <= segment::Header::LEN as _ {
                 trace!("overwriting existing segment");
-                s.ftruncate(0, 0)?;
+                s.ftruncate(0)?;
                 return Ok(s);
             }
         }

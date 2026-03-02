@@ -4,23 +4,45 @@ use std::{
     marker::PhantomData,
     mem,
     ops::{Range, RangeBounds},
+    sync::atomic::{AtomicBool, Ordering},
     vec,
 };
 
 use itertools::Itertools;
 use log::{debug, error, info, trace, warn};
+use scopeguard::defer_on_unwind;
 
 use crate::{
     commit::StoredCommit,
     error::{self, source_chain},
     index::IndexError,
     payload::Decoder,
-    repo::{self, Repo, SegmentLen as _, TxOffsetIndex},
-    segment::{self, FileLike, Transaction, Writer},
+    repo::{self, Repo, SegmentLen as _, SegmentWriter, TxOffsetIndex},
+    segment::{self, Transaction, Writer},
     Commit, Encode, Options, DEFAULT_LOG_FORMAT_VERSION,
 };
 
 pub use crate::segment::Committed;
+
+struct SegmentStore<W: SegmentWriter> {
+    head: Writer<W>,
+    tail: Vec<u64>,
+}
+
+impl<W: SegmentWriter> SegmentStore<W> {
+    fn head(&self) -> &Writer<W> {
+        &self.head
+    }
+
+    fn tail(&self) -> &[u64] {
+        &self.tail
+    }
+
+    fn rotate(&mut self, new: Writer<W>) {
+        let old = mem::replace(&mut self.head, new);
+        self.tail.push(old.min_tx_offset());
+    }
+}
 
 /// A commitlog generic over the storage backend as well as the type of records
 /// its [`Commit`]s contain.
@@ -50,7 +72,7 @@ pub struct Generic<R: Repo, T> {
     /// Set to `true` before any I/O operation, and back to `false` after it
     /// succeeded. This way, we won't try to perform I/O on drop when it is
     /// unlikely to succeed, or even has a chance to panic.
-    panicked: bool,
+    panicked: AtomicBool,
 }
 
 impl<R: Repo, T> Generic<R, T> {
@@ -94,7 +116,7 @@ impl<R: Repo, T> Generic<R, T> {
             tail,
             opts,
             _record: PhantomData,
-            panicked: false,
+            panicked: AtomicBool::new(false),
         })
     }
 
@@ -102,7 +124,7 @@ impl<R: Repo, T> Generic<R, T> {
     ///
     /// See also: [`Commit::epoch`].
     pub fn epoch(&self) -> u64 {
-        self.head.commit.epoch
+        self.head.epoch()
     }
 
     /// Update the current epoch.
@@ -113,7 +135,7 @@ impl<R: Repo, T> Generic<R, T> {
     ///
     /// If `epoch` is smaller than the current epoch, an error of kind
     /// [`io::ErrorKind::InvalidInput`] is returned.
-    pub fn set_epoch(&mut self, epoch: u64) -> io::Result<()> {
+    pub fn set_epoch(&self, epoch: u64) -> io::Result<()> {
         if epoch < self.head.epoch() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -138,12 +160,12 @@ impl<R: Repo, T> Generic<R, T> {
     /// As an `fsync` failure leaves a file in a more of less undefined state,
     /// this method panics in this case, thereby preventing any further writes
     /// to the log and forcing the user to re-read the state from disk.
-    pub fn sync(&mut self) {
-        self.panicked = true;
-        if let Err(e) = self.head.fsync() {
+    pub fn sync(&self) {
+        defer_on_unwind!(self.panicked.store(true, Ordering::SeqCst));
+
+        if let Err(e) = self.head.sync_data() {
             panic!("Failed to fsync segment: {e}");
         }
-        self.panicked = false;
     }
 
     /// Flush the buffered data from previous calls to [Self::commit] to the
@@ -151,8 +173,18 @@ impl<R: Repo, T> Generic<R, T> {
     ///
     /// Call [Self::sync] to instruct the underlying storage to flush its
     /// buffers as well.
-    pub fn flush(&mut self) -> io::Result<()> {
-        self.head.flush()
+    pub fn flush(&self) -> io::Result<()> {
+        defer_on_unwind!(self.panicked.store(true, Ordering::SeqCst));
+
+        let writer = &self.head;
+        writer.flush()?;
+        if writer.len() >= self.opts.max_segment_size {
+            debug!("flush: rotate");
+            self.sync();
+            self.start_new_segment()?;
+        }
+
+        Ok(())
     }
 
     /// Calls [Self::flush] and then [Self::sync].
@@ -193,13 +225,13 @@ impl<R: Repo, T> Generic<R, T> {
     // The offset of `self.head` is always included, regardless of how many
     // entries it actually contains.
     fn segment_offsets_from(&self, offset: u64) -> Vec<u64> {
-        if offset >= self.head.min_tx_offset {
-            vec![self.head.min_tx_offset]
+        if offset >= self.head.min_tx_offset() {
+            vec![self.head.min_tx_offset()]
         } else {
             let mut offs = Vec::with_capacity(self.tail.len() + 1);
             if let Some(pos) = self.tail.iter().rposition(|off| off <= &offset) {
                 offs.extend_from_slice(&self.tail[pos..]);
-                offs.push(self.head.min_tx_offset);
+                offs.push(self.head.min_tx_offset());
             }
 
             offs
@@ -224,14 +256,15 @@ impl<R: Repo, T> Generic<R, T> {
     pub fn reset(mut self) -> io::Result<Self> {
         info!("hard reset");
 
-        self.panicked = true;
+        // Prevent finalizer from running by setting to panicked.
+        self.panicked.store(true, Ordering::Relaxed);
+
         self.tail.reserve(1);
-        self.tail.push(self.head.min_tx_offset);
+        self.tail.push(self.head.min_tx_offset());
         for segment in self.tail.iter().rev() {
             debug!("removing segment {segment}");
             self.repo.remove_segment(*segment)?;
         }
-        // Prevent finalizer from running by not updating self.panicked.
 
         Self::open(self.repo.clone(), self.opts)
     }
@@ -239,11 +272,12 @@ impl<R: Repo, T> Generic<R, T> {
     pub fn reset_to(mut self, offset: u64) -> io::Result<Self> {
         info!("reset to {offset}");
 
-        self.panicked = true;
+        // Prevent finalizer from running by setting to panicked.
+        self.panicked.store(true, Ordering::Relaxed);
+
         self.tail.reserve(1);
-        self.tail.push(self.head.min_tx_offset);
+        self.tail.push(self.head.min_tx_offset());
         reset_to_internal(&self.repo, &self.tail, offset)?;
-        // Prevent finalizer from running by not updating self.panicked.
 
         Self::open(self.repo.clone(), self.opts)
     }
@@ -263,7 +297,6 @@ impl<R: Repo, T> Generic<R, T> {
         let new = repo::create_segment_writer(&self.repo, self.opts, self.head.epoch(), self.head.next_tx_offset())?;
         let old = mem::replace(&mut self.head, new);
         self.tail.push(old.min_tx_offset());
-        self.head.commit = old.commit;
 
         Ok(&mut self.head)
     }
@@ -313,18 +346,22 @@ impl<R: Repo, T: Encode> Generic<R, T> {
     ///
     /// - [Self::sync] panics (called when rotating segments)
     pub fn commit<U: Into<Transaction<T>>>(
-        &mut self,
+        &self,
         transactions: impl IntoIterator<Item = U>,
     ) -> io::Result<Option<Committed>> {
-        self.panicked = true;
-        let writer = &mut self.head;
+        defer_on_unwind!(self.panicked.store(true, Ordering::SeqCst));
+
+        let writer = &self.head;
         let committed = writer.commit(transactions)?;
+        debug!(
+            "writer-len={} max-segment-size={}",
+            writer.len(),
+            self.opts.max_segment_size
+        );
         if writer.len() >= self.opts.max_segment_size {
+            debug!("commit: rotate");
             self.flush().expect("failed to flush segment upon rotation");
-            self.sync();
-            self.start_new_segment()?;
         }
-        self.panicked = false;
 
         Ok(committed)
     }
@@ -369,7 +406,7 @@ impl<R: Repo, T: Encode> Generic<R, T> {
 
 impl<R: Repo, T> Drop for Generic<R, T> {
     fn drop(&mut self) {
-        if !self.panicked {
+        if !self.panicked.load(Ordering::SeqCst) {
             if let Err(e) = self.flush_and_sync() {
                 error!("failed to flush on drop: {e:#}");
             }
@@ -737,14 +774,14 @@ fn reset_to_internal(repo: &impl Repo, segments: &[u64], offset: u64) -> io::Res
                 repo.remove_segment(segment)?;
             } else {
                 debug!("truncating segment {segment} to {offset} at {byte_offset}");
-                let mut file = repo.open_segment_writer(segment)?;
+                let file = repo.open_segment_writer(segment)?;
 
                 if let Some(mut index_file) = index_file {
                     let index_file = index_file.as_mut();
                     // Note: The offset index truncates equal or greater,
                     // inclusive. We'd like to retain `offset` in the index, as
                     // the commit is also retained in the log.
-                    index_file.ftruncate(offset + 1, byte_offset).map_err(|e| {
+                    index_file.truncate(offset + 1).map_err(|e| {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
                             format!("Failed to truncate offset index: {e}"),
@@ -753,9 +790,9 @@ fn reset_to_internal(repo: &impl Repo, segments: &[u64], offset: u64) -> io::Res
                     index_file.async_flush()?;
                 }
 
-                file.ftruncate(offset, byte_offset)?;
+                file.ftruncate(byte_offset)?;
                 // Some filesystems require fsync after ftruncate.
-                file.fsync()?;
+                file.fdatasync()?;
                 break;
             }
         }
@@ -1083,6 +1120,8 @@ mod tests {
 
     #[test]
     fn rotate_segments_simple() {
+        enable_logging();
+
         let mut log = mem_log::<[u8; 32]>(128);
         for i in 0..4 {
             log.commit([(i, [0; 32])]).unwrap();
@@ -1097,6 +1136,8 @@ mod tests {
 
     #[test]
     fn huge_commit() {
+        enable_logging();
+
         let mut log = mem_log::<[u8; 32]>(32);
 
         log.commit([(0, [0; 32]), (1, [1; 32])]).unwrap();
@@ -1212,11 +1253,11 @@ mod tests {
             min_tx_offset: 0,
             n: 1,
             records: tx1.to_vec(),
-            ..log.head.commit.clone()
+            ..log.head.copy_commit()
         };
 
         // Reset the commit offset, so we can write the same commit twice.
-        log.head.commit.min_tx_offset = 0;
+        log.head.modify_commit(|commit| commit.min_tx_offset = 0);
         log.commit([(0, tx1)]).unwrap();
 
         // Write another one.
@@ -1225,7 +1266,7 @@ mod tests {
             min_tx_offset: 1,
             n: 1,
             records: tx2.to_vec(),
-            ..log.head.commit.clone()
+            ..log.head.copy_commit()
         };
 
         log.flush_and_sync().unwrap();
@@ -1247,7 +1288,7 @@ mod tests {
         // Reset the commit offset,
         // and write a different commit at the same offset.
         // This is considered a fork.
-        log.head.commit.min_tx_offset = 0;
+        log.head.modify_commit(|commit| commit.min_tx_offset = 0);
         log.commit([(0, [43; 32])]).unwrap();
 
         log.flush_and_sync().unwrap();
@@ -1264,7 +1305,7 @@ mod tests {
         let mut log = mem_log::<[u8; 32]>(1024);
 
         log.commit([(0, [42; 32])]).unwrap();
-        log.head.commit.min_tx_offset = 18;
+        log.head.modify_commit(|commit| commit.min_tx_offset = 18);
         log.commit([(18, [42; 32])]).unwrap();
 
         log.flush_and_sync().unwrap();
@@ -1388,6 +1429,8 @@ mod tests {
 
     #[test]
     fn reopen() {
+        enable_logging();
+
         let mut log = mem_log::<[u8; 32]>(1024);
         let total_txs = fill_log(&mut log, 100, (1..=10).cycle());
         assert_eq!(

@@ -4,12 +4,9 @@ use std::{
     sync::{Arc, Mutex, RwLock},
 };
 
-use crate::{
-    repo::{
-        mem::{SpaceOnDevice, PAGE_SIZE},
-        SegmentLen,
-    },
-    segment::FileLike,
+use crate::repo::{
+    mem::{SpaceOnDevice, PAGE_SIZE},
+    SegmentLen, SegmentWriter,
 };
 
 pub type SharedLock<T> = Arc<RwLock<T>>;
@@ -178,12 +175,8 @@ impl SegmentLen for Segment {
     }
 }
 
-impl FileLike for Segment {
-    fn fsync(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-
-    fn ftruncate(&mut self, _tx_offset: u64, size: u64) -> io::Result<()> {
+impl SegmentWriter for Segment {
+    fn ftruncate(&self, size: u64) -> io::Result<()> {
         let mut storage = self.storage.write().unwrap();
         let mut avail = self.space.lock().unwrap();
 
@@ -245,6 +238,49 @@ impl FileLike for Segment {
         }
 
         Ok(())
+    }
+
+    fn fdatasync(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn pwrite(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
+        let mut storage = self.storage.write().unwrap();
+
+        let mut remaining = (storage.alloc - offset) as usize;
+        if remaining == 0 {
+            let mut avail = self.space.lock().unwrap();
+            if *avail == 0 {
+                return Err(enospc());
+            }
+
+            let want = (buf.len() - remaining).next_multiple_of(PAGE_SIZE);
+            let have = want.min(*avail as usize);
+
+            storage.alloc += have as u64;
+            *avail -= have as u64;
+            remaining = (storage.alloc - offset) as usize;
+        }
+
+        let offset = offset as usize;
+        let read = buf.len().min(remaining);
+        storage.buf.resize(offset + read, 0);
+        storage.buf[offset..offset + read].copy_from_slice(&buf[..read]);
+
+        Ok(read)
+    }
+
+    fn pread(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        let storage = self.storage.read().unwrap();
+
+        let Some(remaining) = storage.len().checked_sub(offset as usize) else {
+            return Ok(0);
+        };
+        let want = remaining.min(buf.len());
+        let offset = offset as usize;
+        buf[..want].copy_from_slice(&storage.buf[offset..offset + want]);
+
+        Ok(want)
     }
 }
 

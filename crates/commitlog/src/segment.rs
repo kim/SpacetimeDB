@@ -1,18 +1,22 @@
 use std::{
-    fs::File,
-    io::{self, BufWriter, ErrorKind, SeekFrom, Write as _},
+    io::{self, ErrorKind, SeekFrom},
     num::NonZeroU64,
     ops::Range,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex, RwLock,
+    },
 };
 
+use bytes::BytesMut;
 use log::{debug, warn};
 
 use crate::{
     commit::{self, Commit, StoredCommit},
     error,
-    index::{IndexError, IndexFileMut},
+    index::IndexError,
     payload::Encode,
-    repo::{TxOffset, TxOffsetIndex, TxOffsetIndexMut},
+    repo::{SegmentWriter, TxOffset, TxOffsetIndex, TxOffsetIndexMut},
     Options,
 };
 
@@ -42,6 +46,11 @@ impl Header {
         out.write_all(&[self.log_format_version, self.checksum_algorithm, 0, 0])?;
 
         Ok(())
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.extend_from_slice(&MAGIC);
+        buf.extend_from_slice(&[self.log_format_version, self.checksum_algorithm, 0, 0]);
     }
 
     pub fn decode<R: io::Read>(mut read: R) -> io::Result<Self> {
@@ -92,81 +101,163 @@ pub struct Committed {
     pub checksum: u32,
 }
 
-#[derive(Debug)]
-pub struct Writer<W: io::Write> {
-    pub(crate) commit: Commit,
-    pub(crate) inner: BufWriter<W>,
-
-    pub(crate) min_tx_offset: u64,
-    pub(crate) bytes_written: u64,
-
-    pub(crate) offset_index_head: Option<OffsetIndexWriter>,
+pub struct WriterParams {
+    pub epoch: u64,
+    pub min_tx_offset: u64,
+    pub next_tx_offset: u64,
+    pub bytes_written: u64,
+    pub flush_buffer: u64,
 }
 
-impl<W: io::Write> Writer<W> {
+impl Default for WriterParams {
+    fn default() -> Self {
+        Self {
+            epoch: 0,
+            min_tx_offset: 0,
+            next_tx_offset: 0,
+            bytes_written: 0,
+            flush_buffer: 4096,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Writer<W: SegmentWriter> {
+    commit: RwLock<Commit>,
+    inner: W,
+    buf: Mutex<BytesMut>,
+
+    min_tx_offset: u64,
+    bytes_written: AtomicU64,
+    flush_buffer: u64,
+
+    offset_index_head: Option<Mutex<OffsetIndexWriter>>,
+}
+
+impl<W: SegmentWriter> Writer<W> {
+    pub fn new(
+        inner: W,
+        offset_index_head: Option<OffsetIndexWriter>,
+        WriterParams {
+            epoch,
+            min_tx_offset,
+            next_tx_offset,
+            bytes_written,
+            flush_buffer,
+        }: WriterParams,
+    ) -> Self {
+        let commit = RwLock::new(Commit {
+            min_tx_offset: next_tx_offset,
+            n: 0,
+            records: Vec::new(),
+            epoch,
+        });
+        Self {
+            commit,
+            inner,
+            buf: Mutex::new(BytesMut::new()),
+            min_tx_offset,
+            bytes_written: AtomicU64::new(bytes_written),
+            flush_buffer,
+            offset_index_head: offset_index_head.map(Mutex::new),
+        }
+    }
+
     pub fn commit<T: Into<Transaction<U>>, U: Encode>(
-        &mut self,
+        &self,
         transactions: impl IntoIterator<Item = T>,
     ) -> io::Result<Option<Committed>> {
-        for tx in transactions {
-            let tx = tx.into();
-            let expected_offset = self.commit.min_tx_offset + self.commit.n as u64;
-            if tx.offset != expected_offset {
-                self.commit.n = 0;
-                self.commit.records.clear();
+        let (committed_range, checksum, commit_len, should_flush) = {
+            let mut commit = self.commit.write().unwrap();
+            commit.records.clear();
 
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("invalid transaction offset {}, expected {}", tx.offset, expected_offset),
-                ));
+            for tx in transactions {
+                let tx = tx.into();
+                let expected_offset = commit.min_tx_offset + commit.n as u64;
+                if tx.offset != expected_offset {
+                    commit.n = 0;
+                    commit.records.clear();
+
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid transaction offset {}, expected {}", tx.offset, expected_offset),
+                    ));
+                }
+                assert!(
+                    commit.n < u16::MAX,
+                    "maximum number of transactions in a single commit exceeded"
+                );
+                commit.n += 1;
+                tx.txdata.encode_record(&mut commit.records);
             }
-            assert!(
-                self.commit.n < u16::MAX,
-                "maximum number of transactions in a single commit exceeded"
+
+            if commit.n == 0 {
+                return Ok(None);
+            }
+
+            let mut buf = self.buf.lock().unwrap();
+            let checksum = commit.encode(&mut buf);
+
+            let committed_range = commit.tx_range();
+            let commit_len = commit.encoded_len() as u64;
+            let should_flush = buf.len() >= self.flush_buffer as usize;
+
+            commit.min_tx_offset += commit.n as u64;
+            commit.n = 0;
+
+            debug!(
+                "committed={committed_range:?} buf-len={} flush={should_flush}",
+                buf.len()
             );
-            self.commit.n += 1;
-            tx.txdata.encode_record(&mut self.commit.records);
+
+            (committed_range, checksum, commit_len, should_flush)
+        };
+
+        if should_flush {
+            let bytes_written_before_flush = self.bytes_written.load(Ordering::SeqCst);
+            self.flush().expect("failed to flush segment");
+            if let Some(index) = &self.offset_index_head {
+                debug!(
+                    "append_after_commit min_tx_offset={} bytes_written={} commit_len={}",
+                    committed_range.start, bytes_written_before_flush, commit_len
+                );
+                let _ = index
+                    .lock()
+                    .unwrap()
+                    .append_after_commit(committed_range.start, bytes_written_before_flush, commit_len)
+                    .inspect_err(|e| debug!("failed to append to offset index: {e}"));
+            }
         }
-
-        if self.commit.n == 0 {
-            return Ok(None);
-        }
-
-        let checksum = self
-            .commit
-            .write(&mut self.inner)
-            // Panic here as we don't know how much of the commit has been
-            // written (if anything). Further commits would leave corrupted data
-            // in the log.
-            .unwrap_or_else(|e| panic!("failed to write commit {}: {:#}", self.commit.min_tx_offset, e));
-        let commit_len = self.commit.encoded_len() as u64;
-
-        if let Some(index) = self.offset_index_head.as_mut() {
-            let _ = index
-                .append_after_commit(self.commit.min_tx_offset, self.bytes_written, commit_len)
-                .inspect_err(|e| debug!("failed to append to offset index: {e}"));
-        }
-
-        let tx_range_start = self.commit.min_tx_offset;
-
-        self.bytes_written += commit_len;
-        self.commit.min_tx_offset += self.commit.n as u64;
-        self.commit.n = 0;
-        self.commit.records.clear();
 
         Ok(Some(Committed {
-            tx_range: tx_range_start..self.commit.min_tx_offset,
+            tx_range: committed_range,
             checksum,
         }))
     }
 
-    pub fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
+    pub fn flush(&self) -> io::Result<()> {
+        let buf = {
+            let mut buf = self.buf.lock().unwrap();
+            buf.split()
+        };
+
+        if buf.is_empty() {
+            return Ok(());
+        }
+
+        self.inner.pwrite_all(&buf, self.bytes_written.load(Ordering::SeqCst))?;
+        self.bytes_written.fetch_add(buf.len() as u64, Ordering::SeqCst);
+
+        Ok(())
+    }
+
+    pub fn sync_data(&self) -> io::Result<()> {
+        self.inner.fdatasync()
     }
 
     /// Get the current epoch.
     pub fn epoch(&self) -> u64 {
-        self.commit.epoch
+        self.commit.read().unwrap().epoch
     }
 
     /// Update the epoch.
@@ -176,8 +267,8 @@ impl<W: io::Write> Writer<W> {
     /// - The new epoch is greater than the current epoch.
     /// - [`Self::commit`] has been called as appropriate.
     ///
-    pub fn set_epoch(&mut self, epoch: u64) {
-        self.commit.epoch = epoch;
+    pub fn set_epoch(&self, epoch: u64) {
+        self.commit.write().unwrap().epoch = epoch;
     }
 
     /// The smallest transaction offset in this segment.
@@ -187,7 +278,7 @@ impl<W: io::Write> Writer<W> {
 
     /// The next transaction offset to be written if [`Self::commit`] was called.
     pub fn next_tx_offset(&self) -> u64 {
-        self.commit.min_tx_offset
+        self.commit.read().unwrap().min_tx_offset
     }
 
     /// `true` if the segment contains no commits.
@@ -195,99 +286,23 @@ impl<W: io::Write> Writer<W> {
     /// The segment will, however, contain a header. This thus violates the
     /// convention that `is_empty == (len == 0)`.
     pub fn is_empty(&self) -> bool {
-        self.bytes_written <= Header::LEN as u64
+        self.bytes_written.load(Ordering::SeqCst) <= Header::LEN as u64
     }
 
     /// Number of bytes written to this segment, including the header.
     pub fn len(&self) -> u64 {
-        self.bytes_written
-    }
-}
-
-pub trait FileLike {
-    fn fsync(&mut self) -> io::Result<()>;
-    fn ftruncate(&mut self, tx_offset: u64, size: u64) -> io::Result<()>;
-    /// Allocate space for at least `size` bytes in the [FileLike].
-    ///
-    /// The allocated space shall not contain zero bytes, and shall not modify
-    /// the apparent size of the file (as reported by `stat`).
-    ///
-    /// No-op if `size` is smaller than the already allocated space.
-    ///
-    /// In other words, the method shall behave like:
-    ///
-    /// ```ignore
-    /// fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, size)
-    /// ```
-    #[cfg(feature = "fallocate")]
-    fn fallocate(&mut self, size: u64) -> io::Result<()>;
-}
-
-impl FileLike for File {
-    fn fsync(&mut self) -> io::Result<()> {
-        self.sync_data()
+        self.bytes_written.load(Ordering::SeqCst)
     }
 
-    fn ftruncate(&mut self, _tx_offset: u64, size: u64) -> io::Result<()> {
-        self.set_len(size)
+    #[cfg(test)]
+    pub(crate) fn copy_commit(&self) -> Commit {
+        self.commit.read().unwrap().clone()
     }
 
-    #[cfg(all(feature = "fallocate", target_os = "linux"))]
-    fn fallocate(&mut self, size: u64) -> io::Result<()> {
-        use nix::fcntl::{fallocate, FallocateFlags};
-
-        fallocate(self, FallocateFlags::FALLOC_FL_KEEP_SIZE, 0, size as _)?;
-        Ok(())
-    }
-
-    // Fail compilation if `fallocate` is enabled but not supported.
-    #[cfg(all(feature = "fallocate", not(target_os = "linux"), not(any(test, feature = "test"))))]
-    compile_error!("`fallocate(2)` is not available on this platform");
-
-    // No-op if `fallocate` is enabled, unsupported, but this is a test build.
-    //
-    // If it's a test build, we may want to run `fallocate` semantics against
-    // an in-memory backend (on any platform). Hence, we need the method to be
-    // present.
-    #[cfg(all(feature = "fallocate", not(target_os = "linux"), any(test, feature = "test")))]
-    fn fallocate(&mut self, _: u64) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<W: io::Write + FileLike> FileLike for BufWriter<W> {
-    fn fsync(&mut self) -> io::Result<()> {
-        self.get_mut().fsync()
-    }
-
-    fn ftruncate(&mut self, tx_offset: u64, size: u64) -> io::Result<()> {
-        self.get_mut().ftruncate(tx_offset, size)
-    }
-
-    #[cfg(feature = "fallocate")]
-    fn fallocate(&mut self, size: u64) -> io::Result<()> {
-        self.get_mut().fallocate(size)
-    }
-}
-
-impl<W: io::Write + FileLike> FileLike for Writer<W> {
-    fn fsync(&mut self) -> io::Result<()> {
-        self.inner.fsync()?;
-        self.offset_index_head.as_mut().map(|index| index.fsync());
-        Ok(())
-    }
-
-    fn ftruncate(&mut self, tx_offset: u64, size: u64) -> io::Result<()> {
-        self.inner.ftruncate(tx_offset, size)?;
-        self.offset_index_head
-            .as_mut()
-            .map(|index| index.ftruncate(tx_offset, size));
-        Ok(())
-    }
-
-    #[cfg(feature = "fallocate")]
-    fn fallocate(&mut self, size: u64) -> io::Result<()> {
-        self.inner.fallocate(size)
+    #[cfg(test)]
+    pub(crate) fn modify_commit(&self, f: impl FnOnce(&mut Commit)) {
+        let mut commit = self.commit.write().unwrap();
+        f(&mut commit)
     }
 }
 
@@ -352,6 +367,11 @@ impl OffsetIndexWriter {
             return Ok(());
         }
 
+        log::info!(
+            "append {}->{} to index",
+            self.candidate_min_tx_offset,
+            self.candidate_byte_offset
+        );
         self.head
             .append(self.candidate_min_tx_offset, self.candidate_byte_offset)?;
         self.head.async_flush()?;
@@ -359,51 +379,22 @@ impl OffsetIndexWriter {
 
         Ok(())
     }
-}
 
-impl FileLike for OffsetIndexWriter {
-    /// Must be called via SegmentWriter::fsync
-    fn fsync(&mut self) -> io::Result<()> {
-        let _ = self.append_internal().map_err(|e| {
-            warn!("failed to append to offset index: {e:?}");
-        });
+    pub fn flush(&mut self) -> io::Result<()> {
+        let _ = self
+            .append_internal()
+            .inspect_err(|e| warn!("failed to append to offset index: {e:#}"));
+        self.head
+            .async_flush()
+            .inspect_err(|e| warn!("failed to flush offset index: {e:#}"))
+    }
+
+    pub fn truncate(&mut self, offset: TxOffset) {
+        self.reset();
         let _ = self
             .head
-            .async_flush()
-            .map_err(|e| warn!("failed to flush offset index: {e:?}"));
-        Ok(())
-    }
-
-    fn ftruncate(&mut self, tx_offset: u64, _size: u64) -> io::Result<()> {
-        self.reset();
-        self.head
-            .truncate(tx_offset)
-            .inspect_err(|e| {
-                warn!("failed to truncate offset index at {tx_offset}: {e:?}");
-            })
-            .ok();
-        Ok(())
-    }
-
-    #[cfg(feature = "fallocate")]
-    fn fallocate(&mut self, _: u64) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl FileLike for IndexFileMut<TxOffset> {
-    fn fsync(&mut self) -> io::Result<()> {
-        self.async_flush()
-    }
-
-    fn ftruncate(&mut self, tx_offset: u64, _size: u64) -> io::Result<()> {
-        self.truncate(tx_offset)
-            .map_err(|e| io::Error::other(format!("failed to truncate offset index at {tx_offset}: {e:?}")))
-    }
-
-    #[cfg(feature = "fallocate")]
-    fn fallocate(&mut self, _: u64) -> io::Result<()> {
-        Ok(())
+            .truncate(offset)
+            .inspect_err(|e| warn!("failed to truncate offset index at {offset}: {e:#}"));
     }
 }
 
@@ -758,7 +749,11 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::{payload::ArrayDecoder, repo, Options};
+    use crate::{
+        payload::ArrayDecoder,
+        repo::{self, mem::PAGE_SIZE},
+        Options,
+    };
 
     #[test]
     fn header_roundtrip() {
@@ -778,7 +773,7 @@ mod tests {
     fn write_read_roundtrip() {
         let repo = repo::Memory::unlimited();
 
-        let mut writer = repo::create_segment_writer(&repo, <_>::default(), Commit::DEFAULT_EPOCH, 0).unwrap();
+        let writer = repo::create_segment_writer(&repo, <_>::default(), Commit::DEFAULT_EPOCH, 0).unwrap();
         writer.commit([(0, [0; 32]), (1, [1; 32]), (2, [2; 32])]).unwrap();
         writer.flush().unwrap();
 
@@ -805,7 +800,7 @@ mod tests {
     fn metadata() {
         let repo = repo::Memory::unlimited();
 
-        let mut writer = repo::create_segment_writer(&repo, <_>::default(), Commit::DEFAULT_EPOCH, 0).unwrap();
+        let writer = repo::create_segment_writer(&repo, <_>::default(), Commit::DEFAULT_EPOCH, 0).unwrap();
         // Commit 0..2
         writer.commit([(0, [0; 32]), (1, [0; 32])]).unwrap();
         // Commit 2..3
@@ -855,7 +850,7 @@ mod tests {
             vec![(3, [4; 32]), (4, [5; 32])],
         ];
 
-        let mut writer = repo::create_segment_writer(&repo, <_>::default(), Commit::DEFAULT_EPOCH, 0).unwrap();
+        let writer = repo::create_segment_writer(&repo, <_>::default(), Commit::DEFAULT_EPOCH, 0).unwrap();
 
         for commit in &commits {
             writer.commit(commit.clone()).unwrap();
@@ -893,7 +888,7 @@ mod tests {
             vec![(3, [4; 32]), (4, [5; 32])],
         ];
 
-        let mut writer = repo::create_segment_writer(&repo, <_>::default(), Commit::DEFAULT_EPOCH, 0).unwrap();
+        let writer = repo::create_segment_writer(&repo, <_>::default(), Commit::DEFAULT_EPOCH, 0).unwrap();
         for commit in &commits {
             writer.commit(commit.clone()).unwrap();
         }
@@ -910,15 +905,7 @@ mod tests {
 
     #[test]
     fn next_tx_offset() {
-        let mut writer = Writer {
-            commit: Commit::default(),
-            inner: BufWriter::new(Vec::new()),
-
-            min_tx_offset: 0,
-            bytes_written: 0,
-
-            offset_index_head: None,
-        };
+        let writer = Writer::new(repo::mem::Segment::new(PAGE_SIZE as u64), None, WriterParams::default());
 
         assert_eq!(0, writer.next_tx_offset());
         writer.commit([(0, [0; 16])]).unwrap();
@@ -960,7 +947,7 @@ mod tests {
             let retained_val = retained_key * 128;
             let retained = (retained_key, retained_val);
 
-            writer.ftruncate(truncate_to, rand::random()).unwrap();
+            writer.truncate(truncate_to);
             assert_matches!(
                 writer.head.key_lookup(truncate_to),
                 Ok(x) if x == retained,
@@ -976,7 +963,7 @@ mod tests {
         }
 
         // Truncating to 1 leaves no entries in the index
-        writer.ftruncate(1, rand::random()).unwrap();
+        writer.truncate(1);
         assert_matches!(writer.head.key_lookup(1), Err(IndexError::KeyNotFound));
     }
 }

@@ -1,9 +1,4 @@
-use std::{
-    io,
-    num::NonZeroU64,
-    ops::RangeBounds,
-    sync::{Arc, RwLock},
-};
+use std::{io, num::NonZeroU64, ops::RangeBounds, sync::Arc};
 
 use log::trace;
 use repo::{fs::OnNewSegmentFn, Repo};
@@ -156,7 +151,7 @@ impl Options {
 /// Records in the log are of type `T`, which canonically is instantiated to
 /// [`payload::Txdata`].
 pub struct Commitlog<T> {
-    inner: RwLock<commitlog::Generic<repo::Fs, T>>,
+    inner: commitlog::Generic<repo::Fs, T>,
 }
 
 impl<T> Commitlog<T> {
@@ -178,32 +173,28 @@ impl<T> Commitlog<T> {
                 root.display()
             );
         }
-        let inner = commitlog::Generic::open(repo::Fs::new(root, on_new_segment)?, opts)?;
-
-        Ok(Self {
-            inner: RwLock::new(inner),
-        })
+        commitlog::Generic::open(repo::Fs::new(root, on_new_segment)?, opts).map(|inner| Self { inner })
     }
 
     /// Determine the maximum transaction offset considered durable.
     ///
     /// The offset is `None` if the log hasn't been flushed to disk yet.
     pub fn max_committed_offset(&self) -> Option<u64> {
-        self.inner.read().unwrap().max_committed_offset()
+        self.inner.max_committed_offset()
     }
 
     /// Determine the minimum transaction offset in the log.
     ///
     /// The offset is `None` if the log hasn't been flushed to disk yet.
     pub fn min_committed_offset(&self) -> Option<u64> {
-        self.inner.read().unwrap().min_committed_offset()
+        self.inner.min_committed_offset()
     }
 
     /// Get the current epoch.
     ///
     /// See also: [`Commit::epoch`].
     pub fn epoch(&self) -> u64 {
-        self.inner.read().unwrap().epoch()
+        self.inner.epoch()
     }
 
     /// Update the current epoch.
@@ -222,10 +213,8 @@ impl<T> Commitlog<T> {
     ///
     /// Errors from the implicit flush are propagated.
     pub fn set_epoch(&self, epoch: u64) -> io::Result<Option<u64>> {
-        let mut inner = self.inner.write().unwrap();
-        inner.set_epoch(epoch)?;
-
-        Ok(inner.max_committed_offset())
+        self.inner.set_epoch(epoch)?;
+        Ok(self.inner.max_committed_offset())
     }
 
     /// Sync all OS-buffered writes to disk.
@@ -242,11 +231,9 @@ impl<T> Commitlog<T> {
     ///
     /// This method panics if syncing fails irrecoverably.
     pub fn sync(&self) -> Option<u64> {
-        let mut inner = self.inner.write().unwrap();
         trace!("sync commitlog");
-        inner.sync();
-
-        inner.max_committed_offset()
+        self.inner.sync();
+        self.inner.max_committed_offset()
     }
 
     /// Write all outstanding transaction records to disk.
@@ -260,11 +247,9 @@ impl<T> Commitlog<T> {
     ///
     /// Repeatedly calling this method may return the same value.
     pub fn flush(&self) -> io::Result<Option<u64>> {
-        let mut inner = self.inner.write().unwrap();
         trace!("flush commitlog");
-        inner.flush()?;
-
-        Ok(inner.max_committed_offset())
+        self.inner.flush()?;
+        Ok(self.inner.max_committed_offset())
     }
 
     /// Write all outstanding transaction records to disk and flush OS buffers.
@@ -280,12 +265,11 @@ impl<T> Commitlog<T> {
     ///
     /// This method panics if syncing fails irrecoverably.
     pub fn flush_and_sync(&self) -> io::Result<Option<u64>> {
-        let mut inner = self.inner.write().unwrap();
         trace!("flush and sync commitlog");
-        inner.flush()?;
-        inner.sync();
+        self.inner.flush()?;
+        self.inner.sync();
 
-        Ok(inner.max_committed_offset())
+        Ok(self.inner.max_committed_offset())
     }
 
     /// Obtain an iterator which traverses the log from the start, yielding
@@ -321,25 +305,21 @@ impl<T> Commitlog<T> {
     /// containing the given transaction offset, i.e. its `min_tx_offset` may be
     /// smaller than `offset`.
     pub fn commits_from(&self, offset: u64) -> impl Iterator<Item = Result<StoredCommit, error::Traversal>> {
-        self.inner.read().unwrap().commits_from(offset)
+        self.inner.commits_from(offset)
     }
 
     /// Get a list of segment offsets, sorted in ascending order.
     pub fn existing_segment_offsets(&self) -> io::Result<Vec<u64>> {
-        self.inner.read().unwrap().repo.existing_offsets()
+        self.inner.repo.existing_offsets()
     }
 
     /// Compress the segments at the offsets provided, marking them as immutable.
     pub fn compress_segments(&self, offsets: &[u64]) -> io::Result<()> {
-        // even though `compress_segment` takes &self, we take an
-        // exclusive lock to avoid any weirdness happening.
-        #[allow(clippy::readonly_write_lock)]
-        let inner = self.inner.write().unwrap();
-        assert!(!offsets.contains(&inner.head.min_tx_offset()));
+        assert!(!offsets.contains(&self.inner.head.min_tx_offset()));
         // TODO: parallelize, maybe
         offsets
             .iter()
-            .try_for_each(|&offset| inner.repo.compress_segment(offset))
+            .try_for_each(|&offset| self.inner.repo.compress_segment(offset))
     }
 
     /// Remove all data from the log and reopen it.
@@ -351,10 +331,7 @@ impl<T> Commitlog<T> {
     /// Note that the method consumes `self` to ensure the log is not modified
     /// while resetting.
     pub fn reset(self) -> io::Result<Self> {
-        let inner = self.inner.into_inner().unwrap().reset()?;
-        Ok(Self {
-            inner: RwLock::new(inner),
-        })
+        self.inner.reset().map(|inner| Self { inner })
     }
 
     /// Remove all data past the given transaction `offset` from the log and
@@ -369,16 +346,12 @@ impl<T> Commitlog<T> {
     /// Note that the method consumes `self` to ensure the log is not modified
     /// while resetting.
     pub fn reset_to(self, offset: u64) -> io::Result<Self> {
-        let inner = self.inner.into_inner().unwrap().reset_to(offset)?;
-        Ok(Self {
-            inner: RwLock::new(inner),
-        })
+        self.inner.reset_to(offset).map(|inner| Self { inner })
     }
 
     /// Determine the size on disk of this commitlog.
     pub fn size_on_disk(&self) -> io::Result<SizeOnDisk> {
-        let inner = self.inner.read().unwrap();
-        inner.repo.size_on_disk()
+        self.inner.repo.size_on_disk()
     }
 }
 
@@ -422,8 +395,7 @@ impl<T: Encode> Commitlog<T> {
         &self,
         transactions: impl IntoIterator<Item = U>,
     ) -> io::Result<Option<Committed>> {
-        let mut inner = self.inner.write().unwrap();
-        inner.commit(transactions)
+        self.inner.commit(transactions)
     }
 
     /// Obtain an iterator which traverses the log from the start, yielding
@@ -474,7 +446,7 @@ impl<T: Encode> Commitlog<T> {
         D::Error: From<error::Traversal>,
         T: 'a,
     {
-        self.inner.read().unwrap().transactions_from(offset, de)
+        self.inner.transactions_from(offset, de)
     }
 
     /// Traverse the log from the start and "fold" its transactions into the
@@ -514,7 +486,7 @@ impl<T: Encode> Commitlog<T> {
         D: Decoder,
         D::Error: From<error::Traversal>,
     {
-        self.inner.read().unwrap().fold_transactions_from(offset, de)
+        self.inner.fold_transactions_from(offset, de)
     }
 
     pub fn fold_transactions_range<D>(&self, range: impl RangeBounds<u64>, de: D) -> Result<(), D::Error>
@@ -522,7 +494,7 @@ impl<T: Encode> Commitlog<T> {
         D: Decoder,
         D::Error: From<error::Traversal>,
     {
-        self.inner.read().unwrap().fold_transaction_range(range, de)
+        self.inner.fold_transaction_range(range, de)
     }
 }
 

@@ -8,7 +8,7 @@ use std::{
 use futures::StreamExt as _;
 use log::info;
 use spacetimedb_commitlog::{
-    repo::{self, Repo, SegmentLen},
+    repo::{self, Repo, SegmentLen, SegmentWriter},
     stream::{self, OnTrailingData, StreamWriter},
     tests::helpers::enable_logging,
     Commitlog, Options,
@@ -126,7 +126,7 @@ async fn trim_garbage() {
             let last_segment_offset = repo.existing_offsets().unwrap().pop().unwrap();
             let mut segment = repo.open_segment_writer(last_segment_offset).unwrap();
             let len = segment.segment_len().unwrap();
-            segment.set_len(len - 128).unwrap();
+            segment.ftruncate(len - 128).unwrap();
         }
     })
     .await
@@ -184,6 +184,7 @@ fn default_options() -> Options {
     Options {
         max_segment_size: 8 * 1024,
         // Write an index entry for every commit.
+        write_buffer_size: 256,
         offset_index_interval_bytes: NonZeroU64::new(256).unwrap(),
         offset_index_require_segment_fsync: false,
         ..Options::default()

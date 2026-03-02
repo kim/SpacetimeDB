@@ -11,8 +11,8 @@ use pretty_assertions::assert_matches;
 
 use crate::{
     commitlog, payload,
-    repo::{self, Repo, SegmentLen},
-    segment::{self, FileLike},
+    repo::{self, Repo, SegmentLen, SegmentWriter},
+    segment,
     tests::helpers::{enable_logging, fill_log_with},
     Commit, Options, TxOffset, DEFAULT_LOG_FORMAT_VERSION,
 };
@@ -148,7 +148,7 @@ fn first_commit_in_last_segment_corrupt() {
     };
     {
         let mut log = commitlog::Generic::open(repo.clone(), options).unwrap();
-        fill_log_with(&mut log, iter::once([b'x'; 64]).cycle().take(9));
+        fill_log_with(&mut log, iter::once([b'x'; 64]).cycle().take(10));
     }
     let segments = repo.existing_offsets().unwrap();
     assert_eq!(2, segments.len(), "repo should contain 2 segments");
@@ -201,18 +201,24 @@ impl SegmentLen for ShortSegment {
     }
 }
 
-impl FileLike for ShortSegment {
-    fn fsync(&mut self) -> std::io::Result<()> {
-        self.inner.fsync()
+impl SegmentWriter for ShortSegment {
+    fn fdatasync(&self) -> io::Result<()> {
+        self.inner.fdatasync()
     }
 
-    fn ftruncate(&mut self, tx_offset: u64, size: u64) -> std::io::Result<()> {
-        self.inner.ftruncate(tx_offset, size)
+    fn ftruncate(&self, size: u64) -> io::Result<()> {
+        self.inner.ftruncate(size)
     }
 
-    #[cfg(feature = "fallocate")]
-    fn fallocate(&mut self, size: u64) -> io::Result<()> {
-        self.inner.fallocate(size)
+    fn pwrite(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
+        if offset + buf.len() as u64 > self.max_len {
+            return Err(io::Error::from_raw_os_error(ENOSPC));
+        }
+        self.inner.pwrite(buf, offset)
+    }
+
+    fn pread(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        self.inner.pread(buf, offset)
     }
 }
 

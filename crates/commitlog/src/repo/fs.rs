@@ -5,12 +5,11 @@ use std::sync::Arc;
 
 use log::{debug, warn};
 use spacetimedb_fs_utils::compression::{compress_with_zstd, CompressReader};
-use spacetimedb_paths::server::{CommitLogDir, SegmentFile};
+use spacetimedb_paths::server::{CommitLogDir, SegmentFile as SegmentFilePath};
 use tempfile::NamedTempFile;
 
-use crate::segment::FileLike;
-
 use super::{Repo, SegmentLen, TxOffset, TxOffsetIndex, TxOffsetIndexMut};
+use crate::repo::SegmentWriter;
 
 const SEGMENT_FILE_EXT: &str = ".stdb.log";
 
@@ -99,7 +98,7 @@ impl Fs {
 
     /// Get the filename for a segment starting with `offset` within this
     /// repository.
-    pub fn segment_path(&self, offset: u64) -> SegmentFile {
+    pub fn segment_path(&self, offset: u64) -> SegmentFilePath {
         self.root.segment(offset)
     }
 
@@ -139,37 +138,18 @@ impl fmt::Display for Fs {
 
 impl SegmentLen for File {}
 
-impl FileLike for NamedTempFile {
-    fn fsync(&mut self) -> io::Result<()> {
-        self.as_file_mut().fsync()
-    }
-
-    fn ftruncate(&mut self, tx_offset: u64, size: u64) -> io::Result<()> {
-        self.as_file_mut().ftruncate(tx_offset, size)
-    }
-
-    #[cfg(feature = "fallocate")]
-    fn fallocate(&mut self, size: u64) -> io::Result<()> {
-        self.as_file_mut().fallocate(size)
-    }
-}
-
 impl Repo for Fs {
-    type SegmentWriter = File;
+    type SegmentWriter = PosixFile;
     type SegmentReader = CompressReader;
 
     fn create_segment(&self, offset: u64) -> io::Result<Self::SegmentWriter> {
-        File::options()
-            .read(true)
-            .append(true)
-            .create_new(true)
-            .open(self.segment_path(offset))
+        PosixFile::create(self.segment_path(offset))
             .or_else(|e| {
                 if e.kind() == io::ErrorKind::AlreadyExists {
                     debug!("segment {offset} already exists");
                     // If the segment is completely empty, we can resume writing.
-                    let file = self.open_segment_writer(offset)?;
-                    if file.metadata()?.len() == 0 {
+                    let mut file = self.open_segment_writer(offset)?;
+                    if file.segment_len()? == 0 {
                         debug!("segment {offset} is empty");
                         return Ok(file);
                     }
@@ -194,7 +174,7 @@ impl Repo for Fs {
     }
 
     fn open_segment_writer(&self, offset: u64) -> io::Result<Self::SegmentWriter> {
-        File::options().read(true).append(true).open(self.segment_path(offset))
+        PosixFile::open(self.segment_path(offset))
     }
 
     fn open_segment_reader(&self, offset: u64) -> io::Result<Self::SegmentReader> {
@@ -283,4 +263,102 @@ impl crate::stream::AsyncRepo for Fs {
 impl<T> crate::stream::AsyncLen for spacetimedb_fs_utils::compression::AsyncCompressReader<T> where
     T: tokio::io::AsyncSeek + tokio::io::AsyncRead + Unpin + Send
 {
+}
+
+pub struct PosixFile {
+    inner: File,
+}
+
+impl PosixFile {
+    pub fn open(path: SegmentFilePath) -> io::Result<Self> {
+        File::options()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map(|inner| Self { inner })
+    }
+
+    pub fn create(path: SegmentFilePath) -> io::Result<Self> {
+        File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map(|inner| Self { inner })
+    }
+}
+
+impl SegmentWriter for PosixFile {
+    fn fdatasync(&self) -> io::Result<()> {
+        self.inner.sync_data()
+    }
+
+    fn ftruncate(&self, size: u64) -> io::Result<()> {
+        self.inner.set_len(size)
+    }
+
+    #[cfg(all(feature = "fallocate", target_os = "linux"))]
+    fn fallocate(&self, size: u64) -> io::Result<()> {
+        use nix::fcntl::{fallocate, FallocateFlags};
+
+        fallocate(&self.inner, FallocateFlags::FALLOC_FL_KEEP_SIZE, 0, size as _)?;
+        Ok(())
+    }
+
+    // Fail compilation if `fallocate` is enabled but not supported.
+    #[cfg(all(feature = "fallocate", not(target_os = "linux"), not(any(test, feature = "test"))))]
+    compile_error!("`fallocate(2)` is not available on this platform");
+
+    // No-op if `fallocate` is enabled, unsupported, but this is a test build.
+    //
+    // If it's a test build, we may want to run `fallocate` semantics against
+    // an in-memory backend (on any platform). Hence, we need the method to be
+    // present.
+    #[cfg(all(feature = "fallocate", not(target_os = "linux"), any(test, feature = "test")))]
+    fn fallocate(&mut self, _: u64) -> io::Result<()> {
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn pwrite(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
+        std::os::unix::fs::FileExt::write_at(&self.inner, buf, offset)
+    }
+
+    #[cfg(windows)]
+    fn pwrite(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
+        std::os::windows::fs::FileExt::seek_write(&self.inner, buf, offset)
+    }
+
+    #[cfg(unix)]
+    fn pread(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        std::os::unix::fs::FileExt::read_at(&self.inner, buf, offset)
+    }
+
+    #[cfg(windows)]
+    fn pread(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        std::os::windows::fs::FileExt::seek_read(&self.inner, buf, offset)
+    }
+}
+
+impl io::Read for PosixFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl io::Seek for PosixFile {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+impl SegmentLen for PosixFile {}
+
+#[cfg(feature = "streaming")]
+impl crate::stream::IntoAsyncWriter for PosixFile {
+    type AsyncWriter = <File as crate::stream::IntoAsyncWriter>::AsyncWriter;
+
+    fn into_async_writer(self) -> Self::AsyncWriter {
+        self.inner.into_async_writer()
+    }
 }

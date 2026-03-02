@@ -1,12 +1,13 @@
 use std::{fmt, io};
 
+use bytes::BytesMut;
 use log::{debug, warn};
 
 use crate::{
     commit::Commit,
     error,
     index::{IndexFile, IndexFileMut},
-    segment::{FileLike, Header, Metadata, OffsetIndexWriter, Reader, Writer},
+    segment::{self, Header, Metadata, OffsetIndexWriter, Reader, Writer, WriterParams},
     Options,
 };
 
@@ -55,8 +56,31 @@ pub trait SegmentLen: io::Seek {
 pub trait SegmentReader: io::BufRead + SegmentLen + Send + Sync {}
 impl<T: io::BufRead + SegmentLen + Send + Sync> SegmentReader for T {}
 
-pub trait SegmentWriter: FileLike + io::Read + io::Write + SegmentLen + Send + Sync {}
-impl<T: FileLike + io::Read + io::Write + SegmentLen + Send + Sync> SegmentWriter for T {}
+pub trait SegmentWriter: io::Read + SegmentLen + Send + Sync {
+    fn fdatasync(&self) -> io::Result<()>;
+    fn ftruncate(&self, size: u64) -> io::Result<()>;
+    #[cfg(feature = "fallocate")]
+    fn fallocate(&self, size: u64) -> io::Result<()>;
+    fn pwrite(&self, buf: &[u8], offset: u64) -> io::Result<usize>;
+
+    fn pwrite_all(&self, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+        while !buf.is_empty() {
+            match self.pwrite(buf, offset) {
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "failed to write whole buffer")),
+                Ok(n) => {
+                    buf = &buf[n..];
+                    offset += n as u64;
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(())
+    }
+
+    fn pread(&self, buf: &mut [u8], offset: u64) -> io::Result<usize>;
+}
 
 /// A repository of log segments.
 ///
@@ -200,27 +224,26 @@ pub fn create_segment_writer<R: Repo>(
     let mut storage = repo.create_segment(offset)?;
     // Ensure we have enough space for this segment.
     fallocate(&mut storage, &opts)?;
+    let mut buf = BytesMut::with_capacity(segment::Header::LEN);
     Header {
         log_format_version: opts.log_format_version,
         checksum_algorithm: Commit::CHECKSUM_ALGORITHM,
     }
-    .write(&mut storage)?;
-    storage.fsync()?;
+    .encode(&mut buf);
+    storage.pwrite_all(&buf, 0)?;
+    storage.fdatasync()?;
 
-    Ok(Writer {
-        commit: Commit {
-            min_tx_offset: offset,
-            n: 0,
-            records: Vec::new(),
+    Ok(Writer::new(
+        storage,
+        create_offset_index_writer(repo, offset, opts),
+        WriterParams {
             epoch,
+            min_tx_offset: offset,
+            next_tx_offset: offset,
+            bytes_written: Header::LEN as u64,
+            flush_buffer: opts.max_segment_size.min(opts.write_buffer_size as _),
         },
-        inner: io::BufWriter::with_capacity(opts.write_buffer_size, storage),
-
-        min_tx_offset: offset,
-        bytes_written: Header::LEN as u64,
-
-        offset_index_head: create_offset_index_writer(repo, offset, opts),
-    })
+    ))
 }
 
 /// Open the existing segment at `offset` for writing.
@@ -280,20 +303,17 @@ pub fn resume_segment_writer<R: Repo>(
         ));
     }
 
-    Ok(Ok(Writer {
-        commit: Commit {
-            min_tx_offset: tx_range.end,
-            n: 0,
-            records: Vec::new(),
+    Ok(Ok(Writer::new(
+        storage,
+        create_offset_index_writer(repo, offset, opts),
+        WriterParams {
             epoch: max_epoch,
+            min_tx_offset: tx_range.start,
+            next_tx_offset: tx_range.end,
+            bytes_written: size_in_bytes,
+            flush_buffer: opts.max_segment_size.min(4096),
         },
-        inner: io::BufWriter::new(storage),
-
-        min_tx_offset: tx_range.start,
-        bytes_written: size_in_bytes,
-
-        offset_index_head: create_offset_index_writer(repo, offset, opts),
-    }))
+    )))
 }
 
 /// Open the existing segment at `offset` for reading.
@@ -317,7 +337,7 @@ pub fn open_segment_reader<R: Repo>(
 ///
 /// No-op otherwise.
 #[inline]
-pub(crate) fn fallocate(_f: &mut impl FileLike, _opts: &Options) -> io::Result<()> {
+pub(crate) fn fallocate(_f: &mut impl SegmentWriter, _opts: &Options) -> io::Result<()> {
     #[cfg(feature = "fallocate")]
     if _opts.preallocate_segments {
         _f.fallocate(_opts.max_segment_size)?;

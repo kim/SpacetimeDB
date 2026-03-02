@@ -224,7 +224,7 @@ mod tests {
     use tempfile::tempfile;
 
     use super::*;
-    use crate::{segment::FileLike as _, tests::helpers::enable_logging};
+    use crate::{repo::SegmentWriter as _, tests::helpers::enable_logging};
 
     fn read_write_seek(f: &mut (impl Read + Seek + Write)) {
         f.write_all(b"alonso").unwrap();
@@ -278,14 +278,14 @@ mod tests {
         assert_eq!(&buf, &data);
 
         // Extend adds zeroes.
-        segment.ftruncate(42, 1024).unwrap();
+        segment.ftruncate(1024).unwrap();
         buf.clear();
         read_from_start_to_end(&mut segment, &mut buf).unwrap();
         assert_eq!(&buf[..512], &data);
         assert_eq!(&buf[512..], &[0; 512]);
 
         // Extend beyond existing page allocates zeroed page.
-        segment.ftruncate(42, 5120).unwrap();
+        segment.ftruncate(5120).unwrap();
         buf.clear();
         read_from_start_to_end(&mut segment, &mut buf).unwrap();
         assert_eq!(&buf[..512], &data);
@@ -296,18 +296,18 @@ mod tests {
 
         // Extend beyond available space returns `StorageFull`.
         assert_matches!(
-            segment.ftruncate(42, 9216),
+            segment.ftruncate(9216),
             Err(e) if e.kind() == io::ErrorKind::StorageFull
         );
 
         // Shrink deallocates pages.
-        segment.ftruncate(42, 512).unwrap();
+        segment.ftruncate(512).unwrap();
         buf.clear();
         read_from_start_to_end(&mut segment, &mut buf).unwrap();
         assert_eq!(buf, data);
         assert_eq!(segment.allocated_space(), 4096);
 
-        segment.ftruncate(42, 256).unwrap();
+        segment.ftruncate(256).unwrap();
         buf.clear();
         read_from_start_to_end(&mut segment, &mut buf).unwrap();
         assert_eq!(buf, &data[..256]);

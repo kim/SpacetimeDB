@@ -1,9 +1,10 @@
 use std::{
-    io::{self, Read, Write},
+    io::{self, Read},
     ops::Range,
 };
 
-use crc32c::{Crc32cReader, Crc32cWriter};
+use bytes::BytesMut;
+use crc32c::{crc32c, Crc32cReader};
 use spacetimedb_sats::buffer::{BufReader, Cursor, DecodeError};
 
 use crate::{
@@ -156,28 +157,20 @@ impl Commit {
         Self::FRAMING_LEN + self.records.len()
     }
 
-    /// Serialize and write `self` to `out`.
-    ///
-    /// Returns the crc32 checksum of the commit on success.
-    pub fn write<W: Write>(&self, out: W) -> io::Result<u32> {
-        let mut out = Crc32cWriter::new(out);
+    /// Serialize `self` to `buf`, returning the crc32c checksum.
+    pub fn encode(&self, buf: &mut BytesMut) -> u32 {
+        let start = buf.len();
+        buf.extend_from_slice(&self.min_tx_offset.to_le_bytes());
+        buf.extend_from_slice(&self.epoch.to_le_bytes());
+        buf.extend_from_slice(&self.n.to_le_bytes());
+        buf.extend_from_slice(&(self.records.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&self.records);
+        let end = buf.len();
 
-        let min_tx_offset = self.min_tx_offset.to_le_bytes();
-        let epoch = self.epoch.to_le_bytes();
-        let n = self.n.to_le_bytes();
-        let len = (self.records.len() as u32).to_le_bytes();
+        let crc = crc32c(&buf[start..end]);
+        buf.extend_from_slice(&crc.to_le_bytes());
 
-        out.write_all(&min_tx_offset)?;
-        out.write_all(&epoch)?;
-        out.write_all(&n)?;
-        out.write_all(&len)?;
-        out.write_all(&self.records)?;
-
-        let crc = out.crc32c();
-        let mut out = out.into_inner();
-        out.write_all(&crc.to_le_bytes())?;
-
-        Ok(crc)
+        crc
     }
 
     /// Attempt to read one [`Commit`] from the given [`Read`]er.
@@ -415,9 +408,9 @@ mod tests {
             epoch: Commit::DEFAULT_EPOCH,
         };
 
-        let mut buf = Vec::with_capacity(commit.encoded_len());
-        commit.write(&mut buf).unwrap();
-        let commit2 = Commit::decode(&mut buf.as_slice()).unwrap().unwrap();
+        let mut buf = BytesMut::with_capacity(commit.encoded_len());
+        commit.encode(&mut buf);
+        let commit2 = Commit::decode(&mut &*buf).unwrap().unwrap();
 
         assert_eq!(commit, commit2);
     }
@@ -463,14 +456,14 @@ mod tests {
                 epoch: Commit::DEFAULT_EPOCH,
             };
 
-            let mut buf = Vec::with_capacity(commit.encoded_len());
-            commit.write(&mut buf).unwrap();
+            let mut buf = BytesMut::with_capacity(commit.encoded_len());
+            commit.encode(&mut buf);
 
             // Flip bit in the `records` section,
             // so we get `ChecksumMismatch` not any other error.
             buf[pos] ^= mask.get();
 
-            match Commit::decode(&mut buf.as_slice()) {
+            match Commit::decode(&mut &*buf) {
                 Err(e) => {
                     assert_eq!(e.kind(), io::ErrorKind::InvalidData);
                     e.into_inner()
