@@ -10,6 +10,7 @@ use static_assertions::assert_not_impl_any;
 use tokio::runtime;
 
 /// Implementation of [SpacetimeIO] that runs on a tokio runtime.
+#[derive(Clone)]
 pub struct TokioIO {
     rt: runtime::Handle,
     // Ensure I/O stays on a single thread.
