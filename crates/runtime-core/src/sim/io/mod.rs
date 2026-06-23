@@ -458,6 +458,7 @@ mod tests {
         let fd = rt.run(|io| io.create_file("/data/test")).unwrap();
         let mut buf = rt
             .run(|io| io.write_all_at(fd.clone(), Buf([22; 2 * SECTOR_SIZE]), 0))
+            .map_err(ErrorWith::into_err)
             .unwrap();
         buf.clear();
         let buf = rt.run(|io| io.read_exact_at(fd, buf, 0)).unwrap();
