@@ -30,7 +30,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::io::{InspectReader, InspectWriter, StreamReader};
 use zstd_framed::AsyncZstdReader;
 
-use crate::{ObjectType, Snapshot, SnapshotError, SnapshotRepository};
+use crate::{common::read_from_file, ObjectType, Snapshot, SnapshotError, SnapshotRepository};
 
 pub type Result<T> = std::result::Result<T, SnapshotError>;
 
@@ -259,17 +259,18 @@ impl<P: BlobProvider> SnapshotFetcher<P> {
         page_pool: PagePool,
         buf_pool: BufPool,
     ) -> Result<Self> {
-        let snapshot_repo = SnapshotRepository::open(snapshots_dir, snapshot.database_identity, snapshot.replica_id)?;
-        let snapshot_dir = snapshot_repo.snapshot_dir_path(snapshot.tx_offset);
+        let snapshot_repo =
+            SnapshotRepository::open(snapshots_dir, snapshot.database_identity(), snapshot.replica_id())?;
+        let snapshot_dir = snapshot_repo.snapshot_dir_path(snapshot.tx_offset());
         let lock = Lockfile::for_file(&snapshot_dir)?;
         std::fs::create_dir_all(&snapshot_dir)?;
 
         let object_repo = SnapshotRepository::object_repo(&snapshot_dir)?;
-        let parent_offset = snapshot_repo.latest_snapshot_older_than(snapshot.tx_offset)?;
+        let parent_offset = snapshot_repo.latest_snapshot_older_than(snapshot.tx_offset())?;
         // The parent offset must always be smaller than `snapshot`'s offset,
         // because we locked `snapshot_dir`, so this snapshot is not selected.
         debug_assert!(
-            parent_offset.is_none() || parent_offset.is_some_and(|offset| offset < snapshot.tx_offset),
+            parent_offset.is_none() || parent_offset.is_some_and(|offset| offset < snapshot.tx_offset()),
             "invalid parent offset"
         );
         let parent_repo = parent_offset
@@ -306,13 +307,13 @@ impl<P: BlobProvider> SnapshotFetcher<P> {
             buf
         };
         let snapshot_hash = blake3::hash(&snapshot_bsatn);
-        let snapshot_file_path = self.dir.snapshot_file(self.snapshot.tx_offset);
+        let snapshot_file_path = self.dir.snapshot_file(self.snapshot.tx_offset());
         // If the snapshot file already exists at the target path,
         // check that it is valid and that it hashes to `snapshot_hash`.
         if fs::try_exists(&snapshot_file_path).await? {
             let (existing, _) = spawn_blocking({
                 let snapshot_file_path = snapshot_file_path.clone();
-                move || Snapshot::read_from_file(&snapshot_file_path)
+                move || read_from_file(&snapshot_file_path)
             })
             .await
             .unwrap()?;
@@ -352,7 +353,7 @@ impl<P: BlobProvider> SnapshotFetcher<P> {
     async fn fetch_blobs(&self) -> Result<()> {
         let tasks = self
             .snapshot
-            .blobs
+            .blobs()
             .iter()
             .map(|entry| {
                 let hash = blake3::Hash::from_bytes(entry.hash.data);
@@ -368,7 +369,7 @@ impl<P: BlobProvider> SnapshotFetcher<P> {
     async fn fetch_pages(&self) -> Result<()> {
         let tasks = self
             .snapshot
-            .tables
+            .tables()
             .iter()
             .flat_map(|entry| entry.pages.iter().copied().map(|hash| self.fetch_page(hash)))
             .collect::<Box<[_]>>();
@@ -827,7 +828,7 @@ impl AsyncWrite for AsyncBufWriter<'_> {
 #[cfg(test)]
 mod tests {
     use super::{default_page_pool, BlobProvider, BufPool, SnapshotFetcher};
-    use crate::{Snapshot, SnapshotError, CURRENT_MODULE_ABI_VERSION, CURRENT_SNAPSHOT_VERSION, MAGIC};
+    use crate::{v0, Snapshot, SnapshotError, CURRENT_MODULE_ABI_VERSION, CURRENT_SNAPSHOT_VERSION, MAGIC};
     use pretty_assertions::assert_matches;
     use spacetimedb_lib::Identity;
     use spacetimedb_paths::{server::SnapshotsPath, FromPathUnchecked};
@@ -840,7 +841,7 @@ mod tests {
     use zstd_framed::AsyncZstdWriter;
 
     const ZEROES: &[u8] = &[0; 32];
-    const DUMMY_SNAPSHOT: Snapshot = Snapshot {
+    const DUMMY_SNAPSHOT: v0::Snapshot = v0::Snapshot {
         magic: MAGIC,
         version: CURRENT_SNAPSHOT_VERSION,
         database_identity: Identity::ZERO,
@@ -873,7 +874,7 @@ mod tests {
         let sf = SnapshotFetcher::create(
             zeroes_provider(),
             dir,
-            DUMMY_SNAPSHOT,
+            Snapshot::V0(DUMMY_SNAPSHOT),
             default_page_pool(),
             BufPool::default(),
         )
@@ -896,7 +897,7 @@ mod tests {
         let sf = SnapshotFetcher::create(
             const_provider(blob_zstd),
             dir,
-            DUMMY_SNAPSHOT,
+            Snapshot::V0(DUMMY_SNAPSHOT),
             default_page_pool(),
             BufPool::default(),
         )
@@ -924,7 +925,7 @@ mod tests {
         let sf = SnapshotFetcher::create(
             const_provider(page_blob),
             dir,
-            DUMMY_SNAPSHOT,
+            Snapshot::V0(DUMMY_SNAPSHOT),
             default_page_pool(),
             BufPool::default(),
         )
@@ -954,7 +955,7 @@ mod tests {
         let sf = SnapshotFetcher::create(
             const_provider(page_zstd),
             dir,
-            DUMMY_SNAPSHOT,
+            Snapshot::V0(DUMMY_SNAPSHOT),
             default_page_pool(),
             BufPool::default(),
         )

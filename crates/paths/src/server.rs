@@ -250,6 +250,18 @@ path_type! {
     /// `{data-dir}/replica/$replica_id/snapshots/$tx_offset.snapshot_dir/$tx_offset.snapshot_bsatn`
     SnapshotFilePath: file
 }
+
+impl SnapshotFilePath {
+    pub fn snapshot_dir(&self) -> SnapshotDirPath {
+        SnapshotDirPath(
+            self.0
+                .parent()
+                .map(ToOwned::to_owned)
+                .expect("snapshot file must be in a directory"),
+        )
+    }
+}
+
 path_type! {
     /// The objects directory for a snapshot.
     /// `{data-dir}/replica/$replica_id/snapshots/$tx_offset.snapshot_dir/objects`

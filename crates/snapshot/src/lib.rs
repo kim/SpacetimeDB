@@ -33,6 +33,8 @@ use spacetimedb_fs_utils::{
     dir_trie::{o_excl, o_rdonly, CountCreated, DirTrie},
     lockfile::{Lockfile, LockfileError},
 };
+use spacetimedb_lib::de::Deserializer;
+use spacetimedb_lib::ser::Serializer;
 use spacetimedb_lib::Identity;
 use spacetimedb_paths::server::{ArchivedSnapshotDirPath, SnapshotDirPath, SnapshotFilePath, SnapshotsPath};
 use spacetimedb_paths::FromPathUnchecked;
@@ -42,7 +44,6 @@ use spacetimedb_table::tiered::{BlobError, BlobMap, BlobSet, ObjectStoreError, P
 use spacetimedb_table::{blob_store::BlobHash, page::Page, page_pool::PagePool, table::Table};
 use std::fs::{self, File};
 use std::io;
-use std::num::NonZeroUsize;
 use std::ops::{Range, RangeBounds};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -50,14 +51,20 @@ use std::{
     collections::BTreeMap,
     ffi::OsStr,
     fmt,
-    io::{BufWriter, Read, Write},
+    io::{BufWriter, Write},
     ops::{Add, AddAssign},
     path::PathBuf,
 };
 use tokio::task::spawn_blocking;
 
+mod common;
 pub mod remote;
-use remote::verify_snapshot;
+mod v0;
+
+use crate::{
+    common::{read_from_file, read_from_file_with_metrics, reconstruct_blob_store, reconstruct_tables},
+    remote::verify_snapshot,
+};
 
 #[derive(Debug, Copy, Clone)]
 /// An object which may be associated with an error during snapshotting.
@@ -255,7 +262,7 @@ pub struct UnflushedSnapshot {
 impl UnflushedSnapshot {
     /// Return the transaction offset this pending snapshot will finalize at.
     pub fn tx_offset(&self) -> TxOffset {
-        self.inner.as_ref().unwrap().snapshot.tx_offset
+        self.inner.as_ref().unwrap().snapshot.tx_offset()
     }
 
     /// Sync all objects in the snapshot and write out the snapshot file.
@@ -331,157 +338,12 @@ impl PendingSnapshot for UnflushedSnapshot {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Snapshot {
-    /// A magic number: must be equal to [`MAGIC`].
-    magic: [u8; 4],
-
-    /// The snapshot version number. Must be equal to [`CURRENT_SNAPSHOT_VERSION`].
-    version: u8,
-
-    /// The identity of the snapshotted database.
-    pub database_identity: Identity,
-    /// The instance ID of the snapshotted database.
-    pub replica_id: u64,
-
-    /// ABI version of the module from which this snapshot was created, as [MAJOR, MINOR].
-    ///
-    /// As of this proposal, [7, 0].
-    module_abi_version: [u16; 2],
-
-    /// The transaction offset of the state this snapshot reflects.
-    pub tx_offset: TxOffset,
-
-    /// The hashes and reference counts of all objects in the blob store.
-    blobs: Vec<BlobEntry>,
-
-    /// For each table, its table ID followed by the hashes of all resident pages.
-    ///
-    /// It's necessary to store the table ID rather than relying on order
-    /// because table IDs may be sparse (and will be, once we reserve a bunch of system table ids).
-    tables: Vec<TableEntry>,
+#[derive(Clone)]
+pub enum Snapshot {
+    V0(v0::Snapshot),
 }
 
 impl Snapshot {
-    /// Insert a single large blob from a [`BlobSet`]
-    /// into the in-memory snapshot `self`
-    /// and the on-disk object repository `object_repo`.
-    ///
-    /// If the `prev_snapshot` is supplied, this method will attempt to hardlink the blob's on-disk object
-    /// from that previous snapshot into `object_repo` rather than creating a fresh object.
-    fn write_blob(
-        &mut self,
-        object_repo: &DirTrie,
-        hash: &BlobHash,
-        uses: usize,
-        blob: &[u8],
-        prev_snapshot: Option<&DirTrie>,
-        counter: &mut CountCreated,
-    ) -> Result<(), SnapshotError> {
-        object_repo
-            .hardlink_or_write(prev_snapshot, &hash.data, || blob, counter)
-            .map_err(|cause| SnapshotError::WriteObject {
-                ty: ObjectType::Blob(*hash),
-                dest_repo: object_repo.root().to_path_buf(),
-                source_repo: prev_snapshot.map(|dest_repo| dest_repo.root().to_path_buf()),
-                cause,
-            })?;
-        self.blobs.push(BlobEntry {
-            hash: *hash,
-            uses: uses as u32,
-        });
-        Ok(())
-    }
-
-    /// Populate the in-memory snapshot `self`,
-    /// and the on-disk object repository `object_repo`,
-    /// with all large blobs from `blobs`.
-    fn write_all_blobs(
-        &mut self,
-        object_repo: &DirTrie,
-        blobs: &BlobSet,
-        prev_snapshot: Option<&DirTrie>,
-        counter: &mut CountCreated,
-    ) -> Result<(), SnapshotError> {
-        blobs.try_for_each(|hash, uses, blob| {
-            self.write_blob(object_repo, &hash, uses.get(), blob, prev_snapshot, counter)
-        })?;
-
-        Ok(())
-    }
-
-    /// Write a single `page` into the on-disk object repository `object_repo`.
-    ///
-    /// `hash` must be the content hash of `page`, and must be stored in `page.unmodified_hash()`.
-    ///
-    /// Returns the `hash` for convenient use with [`Iter::map`] in [`Self::write_table`].
-    ///
-    /// If the `prev_snapshot` is supplied, this function will attempt to hardlink the page's on-disk object
-    /// from that previous snapshot into `object_repo` rather than creating a fresh object.
-    fn write_page(
-        object_repo: &DirTrie,
-        page: &Page,
-        hash: blake3::Hash,
-        prev_snapshot: Option<&DirTrie>,
-        counter: &mut CountCreated,
-    ) -> Result<blake3::Hash, SnapshotError> {
-        debug_assert!(page.unmodified_hash().copied() == Some(hash));
-
-        object_repo
-            .hardlink_or_write(prev_snapshot, hash.as_bytes(), || bsatn::to_vec(page).unwrap(), counter)
-            .map_err(|cause| SnapshotError::WriteObject {
-                ty: ObjectType::Page(hash),
-                dest_repo: object_repo.root().to_path_buf(),
-                source_repo: prev_snapshot.map(|source_repo| source_repo.root().to_path_buf()),
-                cause,
-            })?;
-
-        Ok(hash)
-    }
-
-    /// Populate the in-memory snapshot `self`,
-    /// and the on-disk object repository `object_repo`,
-    /// with all pages from `table`.
-    fn write_table(
-        &mut self,
-        object_repo: &DirTrie,
-        table: &mut Table,
-        prev_snapshot: Option<&DirTrie>,
-        counter: &mut CountCreated,
-    ) -> Result<(), SnapshotError> {
-        let mut pages = Vec::new();
-        for page in table.iter_pages_with_hashes() {
-            let hash = match page? {
-                None => ZERO_HASH_DENOTING_ABSENT_PAGE,
-                Some((hash, page)) => Self::write_page(object_repo, &page.read(), hash, prev_snapshot, counter)?,
-            };
-
-            pages.push(hash);
-        }
-
-        self.tables.push(TableEntry {
-            table_id: table.schema.table_id,
-            pages,
-        });
-        Ok(())
-    }
-
-    /// Populate the in-memory snapshot `self`,
-    /// and the on-disk object repository `object_repo`,
-    /// with all pages from all tables in `tables`.
-    fn write_all_tables<'db>(
-        &mut self,
-        object_repo: &DirTrie,
-        tables: impl Iterator<Item = &'db mut Table>,
-        prev_snapshot: Option<&DirTrie>,
-        counter: &mut CountCreated,
-    ) -> Result<(), SnapshotError> {
-        for table in tables {
-            self.write_table(object_repo, table, prev_snapshot, counter)?;
-        }
-        Ok(())
-    }
-
     /// Read a [`Snapshot`] from the file at `path`, verify its hash, and return it.
     ///
     /// **NOTE**: It detects if the file was compressed or not.
@@ -492,237 +354,101 @@ impl Snapshot {
     /// - The file at `path` is corrupted,
     ///   as detected by comparing the hash of its bytes to a hash recorded in the file.
     pub fn read_from_file(path: &SnapshotFilePath) -> Result<(Self, CompressType), SnapshotError> {
-        Self::read_from_file_with_metrics(path).map(|(snapshot, compress_type, _metrics)| (snapshot, compress_type))
+        read_from_file(path)
     }
 
-    fn read_from_file_with_metrics(
-        path: &SnapshotFilePath,
-    ) -> Result<(Self, CompressType, SnapshotReadKindMetrics), SnapshotError> {
-        let read_start = Instant::now();
-        let mut read_metrics = SnapshotReadKindMetrics {
-            files: 1,
-            ..Default::default()
-        };
-        let err_read_object = |cause| SnapshotError::ReadObject {
-            ty: ObjectType::Snapshot,
-            source_repo: path.0.clone(),
-            cause,
-        };
-        let snapshot_file = path.open_file(&o_rdonly()).map_err(err_read_object)?;
-        read_metrics.disk_bytes = snapshot_file.metadata().map_err(err_read_object)?.len();
-        let mut snapshot_file = CompressReader::new(snapshot_file)?;
-
-        // The snapshot file is prefixed with the hash of the `Snapshot`'s BSATN.
-        // Read that hash.
-        let mut hash = [0; blake3::OUT_LEN];
-        snapshot_file.read_exact(&mut hash).map_err(err_read_object)?;
-        let hash = blake3::Hash::from_bytes(hash);
-
-        // Read the `Snapshot`'s BSATN and compute its hash.
-        let mut snapshot_bsatn = vec![];
-        snapshot_file
-            .read_to_end(&mut snapshot_bsatn)
-            .map_err(err_read_object)?;
-        let hash_start = Instant::now();
-        let computed_hash = blake3::hash(&snapshot_bsatn);
-        read_metrics.hash_time += hash_start.elapsed();
-
-        // Compare the saved and computed hashes, and fail if they do not match.
-        if hash != computed_hash {
-            return Err(SnapshotError::HashMismatch {
-                ty: ObjectType::Snapshot,
-                expected: *hash.as_bytes(),
-                computed: *computed_hash.as_bytes(),
-                source_repo: path.0.clone(),
-            });
+    /// The transaction offset at which this snapshot was taken.
+    pub fn tx_offset(&self) -> TxOffset {
+        match self {
+            Self::V0(inner) => inner.tx_offset,
         }
-
-        let snapshot = bsatn::from_slice::<Snapshot>(&snapshot_bsatn).map_err(|cause| SnapshotError::Deserialize {
-            ty: ObjectType::Snapshot,
-            source_repo: path.0.clone(),
-            cause,
-        })?;
-
-        read_metrics.read_time += read_start.elapsed();
-
-        Ok((snapshot, snapshot_file.compress_type(), read_metrics))
     }
 
-    fn read_object_with_disk_bytes(
-        object_repo: &DirTrie,
-        file_id: &[u8; blake3::OUT_LEN],
-        ty: ObjectType,
-    ) -> Result<(Vec<u8>, u64), SnapshotError> {
-        let source_repo = || object_repo.root().to_path_buf();
-        let disk_bytes = fs::metadata(object_repo.file_path(file_id))
-            .map_err(|cause| SnapshotError::ReadObject {
-                ty,
-                source_repo: source_repo(),
-                cause,
-            })?
-            .len();
-        let buf = object_repo
-            .read_entry(file_id)
-            .map_err(|cause| SnapshotError::ReadObject {
-                ty,
-                source_repo: source_repo(),
-                cause,
-            })?;
-        Ok((buf, disk_bytes))
-    }
-
-    /// Construct a [`BlobMap`] containing all the blobs referenced in `self`,
-    /// reading their data from files in the `object_repo`.
+    /// The transaction offset at which this snapshot was taken, as a mutable borrow.
     ///
-    /// Fails if any of the object files is missing or corrupted,
-    /// as detected by comparing the hash of its bytes to the hash recorded in `self`.
-    fn reconstruct_blob_store(
-        &self,
-        object_repo: &DirTrie,
-        metrics: &mut SnapshotReadKindMetrics,
-    ) -> Result<BlobMap, SnapshotError> {
-        let mut blob_store = BlobMap::default();
-
-        for BlobEntry { hash, uses } in &self.blobs {
-            // Read the bytes of the blob object.
-            let (buf, disk_bytes) =
-                Self::read_object_with_disk_bytes(object_repo, &hash.data, ObjectType::Blob(*hash))?;
-            metrics.disk_bytes += disk_bytes;
-
-            // Compute the blob's hash.
-            let hash_start = Instant::now();
-            let computed_hash = BlobHash::hash_from_bytes(&buf);
-            metrics.hash_time += hash_start.elapsed();
-
-            // Compare the computed hash to the one recorded in the `Snapshot`,
-            // and fail if they do not match.
-            if *hash != computed_hash {
-                return Err(SnapshotError::HashMismatch {
-                    ty: ObjectType::Blob(*hash),
-                    expected: hash.data,
-                    computed: computed_hash.data,
-                    source_repo: object_repo.root().to_path_buf(),
-                });
-            }
-
-            if let Some(uses) = NonZeroUsize::new(*uses as usize) {
-                blob_store.insert_with_uses(hash, uses, buf.into());
-            }
+    /// NOTE: This is exposed for integration tests.
+    pub fn tx_offset_mut(&mut self) -> &mut TxOffset {
+        match self {
+            Self::V0(inner) => &mut inner.tx_offset,
         }
-
-        Ok(blob_store)
     }
 
-    /// Read all the pages referenced by `pages` from the `object_repo`.
-    ///
-    /// Fails if any of the pages files is missing or corrupted,
-    /// as detected by comparing the hash of its bytes to the hash listed in `pages`.
-    fn reconstruct_one_table_pages(
-        object_repo: &DirTrie,
-        pages: &[blake3::Hash],
-        page_pool: &PagePool,
-        metrics: &mut SnapshotReadKindMetrics,
-    ) -> Result<TablePages, SnapshotError> {
-        pages
-            .iter()
-            .map(|hash| {
-                if *hash == ZERO_HASH_DENOTING_ABSENT_PAGE {
-                    Ok(None)
-                } else {
-                    // Read the BSATN bytes of the on-disk page object.
-                    let (buf, disk_bytes) =
-                        Self::read_object_with_disk_bytes(object_repo, hash.as_bytes(), ObjectType::Page(*hash))?;
-                    metrics.disk_bytes += disk_bytes;
-
-                    // Deserialize the bytes into a `Page`.
-                    let page = page_pool.take_deserialize_from(&buf);
-                    let page = page.map_err(|cause| SnapshotError::Deserialize {
-                        ty: ObjectType::Page(*hash),
-                        source_repo: object_repo.root().to_path_buf(),
-                        cause,
-                    })?;
-
-                    // Compute the hash of the page.
-                    let hash_start = Instant::now();
-                    let computed_hash = page.content_hash();
-                    metrics.hash_time += hash_start.elapsed();
-
-                    // Compare the computed hash to the one recorded in the `Snapshot`,
-                    // and fail if they do not match.
-                    if *hash != computed_hash {
-                        return Err(SnapshotError::HashMismatch {
-                            ty: ObjectType::Page(*hash),
-                            expected: *hash.as_bytes(),
-                            computed: *computed_hash.as_bytes(),
-                            source_repo: object_repo.root().to_path_buf(),
-                        });
-                    }
-
-                    Ok::<Option<Box<Page>>, SnapshotError>(Some(page))
-                }
-            })
-            .collect()
-    }
-
-    fn reconstruct_one_table(
-        object_repo: &DirTrie,
-        TableEntry { table_id, pages }: &TableEntry,
-        page_pool: &PagePool,
-        metrics: &mut SnapshotReadKindMetrics,
-    ) -> Result<(TableId, TablePages), SnapshotError> {
-        Ok((
-            *table_id,
-            Self::reconstruct_one_table_pages(object_repo, pages, page_pool, metrics)?,
-        ))
-    }
-
-    /// Reconstruct all the table data from `self`,
-    /// reading pages from files in the `object_repo`.
-    ///
-    /// This method cannot construct [`Table`] objects
-    /// because doing so requires knowledge of the system tables' schemas
-    /// to compute the schemas of the user-defined tables
-    ///
-    /// Fails if any object file referenced in `self` (as a page or large blob)
-    /// is missing or corrupted,
-    /// as detected by comparing the hash of its bytes to the hash recorded in `self`.
-    fn reconstruct_tables(
-        &self,
-        object_repo: &DirTrie,
-        page_pool: &PagePool,
-        metrics: &mut SnapshotReadKindMetrics,
-    ) -> Result<BTreeMap<TableId, TablePages>, SnapshotError> {
-        self.tables
-            .iter()
-            .map(|tbl| Self::reconstruct_one_table(object_repo, tbl, page_pool, metrics))
-            .collect()
-    }
-
-    /// The number of objects in this snapshot, both blobs and pages.
+    /// The total number of objects this snapshot references.
     pub fn total_objects(&self) -> usize {
-        self.blobs.len()
-            + self
-                .tables
-                .iter()
-                .map(|table| table_num_present_pages(&table.pages) as usize)
-                .sum::<usize>()
+        match self {
+            Self::V0(inner) => inner.total_objects(),
+        }
     }
 
     /// Obtain an iterator over the [`blake3::Hash`]es of all objects
     /// this snapshot is referring to.
     pub fn objects(&self) -> impl Iterator<Item = blake3::Hash> + '_ {
-        self.blobs
-            .iter()
-            .map(|b| blake3::Hash::from_bytes(b.hash.data))
-            .chain(self.tables.iter().flat_map(|t| table_present_pages(&t.pages)))
+        match self {
+            Self::V0(inner) => inner.objects(),
+        }
     }
 
     /// Obtain an iterator over the [`PathBuf`]s of all objects
-    pub fn files<'a>(&'a self, src_repo: &'a DirTrie) -> impl Iterator<Item = (blake3::Hash, PathBuf)> + 'a {
-        self.objects().map(move |hash| {
-            let path = src_repo.file_path(hash.as_bytes());
-            (hash, path)
-        })
+    pub fn files<'a>(&'a self, repo: &'a DirTrie) -> impl Iterator<Item = (blake3::Hash, PathBuf)> + 'a {
+        match self {
+            Self::V0(inner) => inner.files(repo),
+        }
+    }
+
+    fn magic(&self) -> [u8; 4] {
+        match self {
+            Self::V0(inner) => inner.magic,
+        }
+    }
+
+    fn version(&self) -> u8 {
+        match self {
+            Self::V0(inner) => inner.version,
+        }
+    }
+
+    fn database_identity(&self) -> Identity {
+        match self {
+            Self::V0(inner) => inner.database_identity,
+        }
+    }
+
+    fn replica_id(&self) -> u64 {
+        match self {
+            Self::V0(inner) => inner.replica_id,
+        }
+    }
+
+    fn module_abi_version(&self) -> [u16; 2] {
+        match self {
+            Self::V0(inner) => inner.module_abi_version,
+        }
+    }
+
+    fn blobs(&self) -> &Vec<BlobEntry> {
+        match self {
+            Self::V0(inner) => &inner.blobs,
+        }
+    }
+
+    fn tables(&self) -> &Vec<TableEntry> {
+        match self {
+            Self::V0(inner) => &inner.tables,
+        }
+    }
+}
+
+impl Serialize for Snapshot {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::V0(v0) => v0.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Snapshot {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        v0::Snapshot::deserialize(deserializer).map(Self::V0)
     }
 }
 
@@ -949,7 +675,7 @@ impl SnapshotRepository {
 
         Ok(UnflushedSnapshot {
             inner: Some(UnflushedSnapshotInner {
-                snapshot,
+                snapshot: Snapshot::V0(snapshot),
                 snapshot_dir,
                 snapshot_repo: self.clone(),
                 object_repo,
@@ -975,7 +701,7 @@ impl SnapshotRepository {
         // Create the snapshot file, containing first the hash, then the `Snapshot`.
         {
             let mut snapshot_file =
-                BufWriter::new(snapshot_dir.snapshot_file(snapshot.tx_offset).open_file(&o_excl())?);
+                BufWriter::new(snapshot_dir.snapshot_file(snapshot.tx_offset()).open_file(&o_excl())?);
             snapshot_file.write_all(hash.as_bytes())?;
             snapshot_file.write_all(&snapshot_bsatn)?;
             snapshot_file.flush()?;
@@ -990,10 +716,10 @@ impl SnapshotRepository {
         Ok(())
     }
 
-    fn empty_snapshot(&self, tx_offset: TxOffset) -> Snapshot {
-        Snapshot {
+    fn empty_snapshot(&self, tx_offset: TxOffset) -> v0::Snapshot {
+        v0::Snapshot {
             magic: MAGIC,
-            version: CURRENT_SNAPSHOT_VERSION,
+            version: v0::SNAPSHOT_VERSION,
             database_identity: self.database_identity,
             replica_id: self.replica_id,
             module_abi_version: CURRENT_MODULE_ABI_VERSION,
@@ -1074,19 +800,20 @@ impl SnapshotRepository {
         }
 
         let snapshot_file_path = snapshot_dir.snapshot_file(tx_offset);
-        let (snapshot, compress_type, metadata_metrics) = Snapshot::read_from_file_with_metrics(&snapshot_file_path)?;
+        let (snapshot, compress_type, metadata_metrics) = read_from_file_with_metrics(&snapshot_file_path)?;
+
         let mut read_metrics = SnapshotReadMetrics {
             metadata: metadata_metrics,
             ..Default::default()
         };
-        read_metrics.blob.files = snapshot.blobs.len() as u64;
+        read_metrics.blob.files = snapshot.blobs().len() as u64;
         read_metrics.page.files = snapshot
-            .tables
+            .tables()
             .iter()
             .map(|table| table_num_present_pages(&table.pages))
             .sum();
         read_metrics.absent_pages = snapshot
-            .tables
+            .tables()
             .iter()
             .map(|table| {
                 table
@@ -1097,17 +824,17 @@ impl SnapshotRepository {
             })
             .sum();
 
-        if snapshot.magic != MAGIC {
+        if snapshot.magic() != MAGIC {
             return Err(SnapshotError::BadMagic {
                 tx_offset,
-                magic: snapshot.magic,
+                magic: snapshot.magic(),
             });
         }
 
-        if snapshot.version != CURRENT_SNAPSHOT_VERSION {
+        if snapshot.version() != CURRENT_SNAPSHOT_VERSION {
             return Err(SnapshotError::BadVersion {
                 tx_offset,
-                version: snapshot.version,
+                version: snapshot.version(),
             });
         }
 
@@ -1115,18 +842,18 @@ impl SnapshotRepository {
         let object_repo = Self::object_repo(&snapshot_dir)?;
 
         let blob_start = Instant::now();
-        let blob_store = snapshot.reconstruct_blob_store(&object_repo, &mut read_metrics.blob)?;
+        let blob_store = reconstruct_blob_store(snapshot.blobs(), &object_repo, &mut read_metrics.blob)?;
         read_metrics.blob.read_time = blob_start.elapsed();
 
         let page_start = Instant::now();
-        let tables = snapshot.reconstruct_tables(&object_repo, page_pool, &mut read_metrics.page)?;
+        let tables = reconstruct_tables(snapshot.tables(), &object_repo, page_pool, &mut read_metrics.page)?;
         read_metrics.page.read_time = page_start.elapsed();
 
         Ok(ReconstructedSnapshot {
-            database_identity: snapshot.database_identity,
-            replica_id: snapshot.replica_id,
-            tx_offset: snapshot.tx_offset,
-            module_abi_version: snapshot.module_abi_version,
+            database_identity: snapshot.database_identity(),
+            replica_id: snapshot.replica_id(),
+            tx_offset: snapshot.tx_offset(),
+            module_abi_version: snapshot.module_abi_version(),
             blob_store,
             tables,
             compress_type,
@@ -1168,12 +895,12 @@ impl SnapshotRepository {
                 }
 
                 let snapshot_file_path = snapshot_dir.snapshot_file(tx_offset);
-                let (snapshot, _compress_type) = Snapshot::read_from_file(&snapshot_file_path)?;
+                let (snapshot, _) = read_from_file(&snapshot_file_path)?;
 
-                if snapshot.magic != MAGIC {
+                if snapshot.magic() != MAGIC {
                     return Err(SnapshotError::BadMagic {
                         tx_offset,
-                        magic: snapshot.magic,
+                        magic: snapshot.magic(),
                     });
                 }
                 Ok(snapshot)
@@ -1337,20 +1064,20 @@ impl SnapshotRepository {
         let (tx_offset, snapshot_dir) = current;
         let tx_offset = *tx_offset;
         let snapshot_file = snapshot_dir.snapshot_file(tx_offset);
-        let (snapshot, compress_type) = Snapshot::read_from_file(&snapshot_file)?;
+        let (snapshot, compress_type) = read_from_file(&snapshot_file)?;
 
         let mut stats = ObjectCompressionStats::default();
         if let Some(algo) = compress_type.algorithm() {
             log::debug!(
                 "Snapshot {snapshot_dir:?} of replica {} is already compressed: {algo:?}",
-                snapshot.replica_id
+                snapshot.replica_id()
             );
             return Ok(stats);
         }
 
         let old = if let Some((tx_offset, snapshot_dir)) = parent {
             let snapshot_file = snapshot_dir.snapshot_file(*tx_offset);
-            let (snapshot, _) = Snapshot::read_from_file(&snapshot_file)?;
+            let (snapshot, _) = read_from_file(&snapshot_file)?;
             let dir = SnapshotRepository::object_repo(snapshot_dir)?;
             snapshot.files(&dir).collect()
         } else {
@@ -1400,7 +1127,7 @@ impl SnapshotRepository {
 
         log::info!(
             "Compressing snapshot {snapshot_dir:?} of replica {}",
-            snapshot.replica_id
+            snapshot.replica_id()
         );
 
         let dir = SnapshotRepository::object_repo(snapshot_dir)?;
@@ -1422,7 +1149,7 @@ impl SnapshotRepository {
 
         log::info!(
             "Compressed snapshot {snapshot_dir:?} of replica {}: {compress_type:?}",
-            snapshot.replica_id
+            snapshot.replica_id()
         );
         Ok(stats)
     }
@@ -1480,7 +1207,7 @@ impl SnapshotRepository {
         let snapshot_file = snapshot_dir.snapshot_file(offset);
         let snapshot_file_size = snapshot_file.metadata()?.len();
 
-        let (snapshot, compress_type) = Snapshot::read_from_file(&snapshot_file)?;
+        let (snapshot, compress_type) = read_from_file(&snapshot_file)?;
 
         size.snapshot = match compress_type {
             CompressType::None => CompressCount { none: 1, zstd: 0 },
@@ -1697,7 +1424,7 @@ mod tests {
                 schema.into(),
                 SquashedOffset::COMMITTED_STATE,
                 storage.pages().clone(),
-                EvictionPolicy::Evictable,
+                EvictionPolicy::Memory,
             )
         });
         tables[0].insert(storage.blobs(), &product![11_u64])?;

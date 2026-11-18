@@ -73,7 +73,7 @@ async fn can_sync_a_snapshot() -> anyhow::Result<()> {
 
     // Lastly, pretend the next snapshot has the same objects and
     // assert that they all get hardlinked.
-    src_snapshot.tx_offset += SNAPSHOT_FREQUENCY;
+    *src_snapshot.tx_offset_mut() += SNAPSHOT_FREQUENCY;
     let stats = synchronize_snapshot(blob_provider.clone(), dst_path.clone(), src_snapshot.clone()).await?;
     assert_eq!(stats.objects_hardlinked, total_objects);
 
@@ -105,7 +105,7 @@ async fn rejects_overwrite() -> anyhow::Result<()> {
     let src_snapshot_path = src.repo.snapshot_dir_path(prev_offset);
     let (mut src_snapshot, _) = Snapshot::read_from_file(&src_snapshot_path.snapshot_file(prev_offset))?;
     // Pretend it's the current snapshot, thereby altering the preimage.
-    src_snapshot.tx_offset = src.offset;
+    *src_snapshot.tx_offset_mut() = src.offset;
 
     let res = synchronize_snapshot(blob_provider, dst_path, src_snapshot).await;
     assert_matches!(res, Err(SnapshotError::HashMismatch { .. }));
@@ -129,7 +129,7 @@ async fn verifies_objects() -> anyhow::Result<()> {
     // Read objects for verification from the destination repo.
     let blob_provider = spawn_blocking({
         let dst_path = dst_path.clone();
-        let snapshot_offset = src_snapshot.tx_offset;
+        let snapshot_offset = src_snapshot.tx_offset();
         move || {
             let repo = SnapshotRepository::open(dst_path, Identity::ZERO, 0)?;
             let objects = SnapshotRepository::object_repo(&repo.snapshot_dir_path(snapshot_offset))?;
