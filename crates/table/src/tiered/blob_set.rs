@@ -1,7 +1,7 @@
 use super::metrics::{CacheTier, EvictionDirection, ObjectType};
 use std::{num::NonZeroUsize, ops::Deref, sync::Arc};
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use spacetimedb_data_structures::{
     map::{hash_map, IntMap},
     small_map::SmallHashMap,
@@ -19,7 +19,7 @@ use crate::{
         map::{BlobHashWrapper, ObjectKey},
         mem::{self, BlobEvictionCandidate, BlobFrame, EvictionSource, ReservedBlob},
         storage::{DiskObject, DiskRetention, Object},
-        ByteBudget, ByteBudgetUsage, EvictionPolicy, TieredStorage,
+        ByteBudget, ByteBudgetUsage, EvictionPolicy, ObjectBytes, TieredStorage,
     },
     var_len::VarLenMembers,
 };
@@ -497,6 +497,13 @@ impl BlobSet {
         Ok(())
     }
 
+    pub fn scan(&self) -> BlobScan<'_> {
+        BlobScan {
+            entries: self.entries.read(),
+            storage: &self.storage,
+        }
+    }
+
     /// Sums size + hash bytes of each resident blob in the set.
     pub fn resident_bytes_used_by_blobs(&self) -> u64 {
         self.entries
@@ -866,6 +873,53 @@ impl EvictionSource for BlobSetInner {
         }
 
         Ok(bytes_freed)
+    }
+}
+
+pub struct ScannedBlob<'a> {
+    pub hash: BlobHash,
+    pub uses: NonZeroUsize,
+    pub data: ScannedBlobData<'a>,
+}
+
+pub enum ScannedBlobData<'a> {
+    Resident(&'a [u8]),
+    Stored(ObjectBytes),
+}
+
+impl AsRef<[u8]> for ScannedBlobData<'_> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Resident(bytes) => bytes,
+            Self::Stored(bytes) => bytes.as_ref(),
+        }
+    }
+}
+
+pub struct BlobScan<'a> {
+    entries: RwLockReadGuard<'a, IntMap<BlobHashWrapper, BlobEntry>>,
+    storage: &'a TieredStorage,
+}
+
+impl<'a> BlobScan<'a> {
+    pub fn iter(&'a self) -> impl Iterator<Item = Result<ScannedBlob<'a>, ObjectStoreError>> + 'a {
+        self.entries.iter().filter_map(move |(&hash, entry)| {
+            let uses = NonZeroUsize::new(entry.uses())?;
+            let get_or_read = || {
+                let data = match entry {
+                    BlobEntry::Resident { blob, .. } => ScannedBlobData::Resident(blob),
+                    BlobEntry::NonResident { .. } => self.storage.read(hash.into()).map(ScannedBlobData::Stored)?,
+                };
+
+                Ok(ScannedBlob {
+                    hash: hash.into(),
+                    uses,
+                    data,
+                })
+            };
+
+            Some(get_or_read())
+        })
     }
 }
 

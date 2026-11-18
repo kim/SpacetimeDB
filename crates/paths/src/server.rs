@@ -268,6 +268,27 @@ path_type! {
     SnapshotObjectsPath: dir
 }
 
+impl SnapshotObjectsPath {
+    pub fn pages(&self) -> SnapshotPagesPath {
+        SnapshotPagesPath(self.0.join("pages"))
+    }
+
+    pub fn blobs(&self) -> SnapshotBlobsPath {
+        SnapshotBlobsPath(self.0.join("blobs"))
+    }
+}
+path_type! {
+    /// The pages directory within a [SnapshotObjectsPath]
+    /// `{data-dir}/replica/$replica_id/snapshots/$tx_offset.snapshot_dir/objects/pages`
+    SnapshotPagesPath: dir
+}
+
+path_type! {
+    /// The blobs directory within a [SnapshotObjectsPath]
+    /// `{data-dir}/replica/$replica_id/snapshots/$tx_offset.snapshot_dir/objects/blobs`
+    SnapshotBlobsPath: dir
+}
+
 path_type! {
     /// The commit log directory. `{data-dir}/replica/$replica_id/clog`
     CommitLogDir: dir

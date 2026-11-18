@@ -1,24 +1,36 @@
-use std::{collections::BTreeMap, fs, io::Read as _, num::NonZeroUsize, time::Instant};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::{BufWriter, Read as _, Write as _},
+    num::NonZeroUsize,
+    time::Instant,
+};
 
 use spacetimedb_fs_utils::{
     compression::{CompressReader, CompressType},
-    dir_trie::{o_rdonly, DirTrie},
+    dir_trie::{o_excl, o_rdonly, CountCreated, DirTrie},
 };
 use spacetimedb_lib::bsatn;
 use spacetimedb_paths::server::SnapshotFilePath;
 use spacetimedb_primitives::TableId;
-use spacetimedb_table::{blob_store::BlobHash, page::Page, page_pool::PagePool, tiered::BlobMap};
-
-use crate::{
-    v0, BlobEntry, ObjectType, Snapshot, SnapshotError, SnapshotReadKindMetrics, TableEntry, TablePages, MAGIC,
-    ZERO_HASH_DENOTING_ABSENT_PAGE,
+use spacetimedb_table::{
+    blob_store::BlobHash,
+    page::Page,
+    page_pool::PagePool,
+    table::Table,
+    tiered::{BlobMap, ObjectStoreError, ScannedBlob},
 };
 
-pub fn read_from_file(path: &SnapshotFilePath) -> Result<(Snapshot, CompressType), SnapshotError> {
+use crate::{
+    v0, v1, BlobEntry, FileOrDirPath, ObjectType, Snapshot, SnapshotError, SnapshotReadKindMetrics, TableEntry,
+    TablePages, MAGIC, ZERO_HASH_DENOTING_ABSENT_PAGE,
+};
+
+pub(crate) fn read_from_file(path: &SnapshotFilePath) -> Result<(Snapshot, CompressType), SnapshotError> {
     read_from_file_with_metrics(path).map(|(snapshot, compress_type, _metrics)| (snapshot, compress_type))
 }
 
-pub fn read_from_file_with_metrics(
+pub(crate) fn read_from_file_with_metrics(
     path: &SnapshotFilePath,
 ) -> Result<(Snapshot, CompressType, SnapshotReadKindMetrics), SnapshotError> {
     let read_start = Instant::now();
@@ -74,28 +86,31 @@ pub fn read_from_file_with_metrics(
         });
     }
 
+    let deserialize_err = |cause| SnapshotError::Deserialize {
+        ty: ObjectType::Snapshot,
+        source_repo: path.0.clone(),
+        cause,
+    };
+
     let snapshot = match version {
         v0::SNAPSHOT_VERSION => bsatn::from_slice(&snapshot_bsatn)
-            .map_err(|cause| SnapshotError::Deserialize {
-                ty: ObjectType::Snapshot,
-                source_repo: path.0.clone(),
-                cause,
-            })
-            .map(Snapshot::V0)?,
-        v => {
-            return Err(SnapshotError::BadVersion {
-                tx_offset: path.snapshot_dir().tx_offset().expect("invalid snapshot directory"),
-                version: v,
-            })
-        }
-    };
+            .map_err(deserialize_err)
+            .map(Snapshot::V0),
+        v1::SNAPSHOT_VERSION => bsatn::from_slice(&snapshot_bsatn)
+            .map_err(deserialize_err)
+            .map(Snapshot::V1),
+        v => Err(SnapshotError::BadVersion {
+            tx_offset: path.snapshot_dir().tx_offset().expect("invalid snapshot directory"),
+            version: v,
+        }),
+    }?;
 
     read_metrics.read_time += read_start.elapsed();
 
     Ok((snapshot, snapshot_file.compress_type(), read_metrics))
 }
 
-pub fn reconstruct_blob_store(
+pub(crate) fn reconstruct_blob_store(
     blobs: &[BlobEntry],
     repo: &DirTrie,
     metrics: &mut SnapshotReadKindMetrics,
@@ -162,7 +177,7 @@ fn read_object_with_disk_bytes(
 /// Fails if any object file referenced in `self` (as a page or large blob)
 /// is missing or corrupted,
 /// as detected by comparing the hash of its bytes to the hash recorded in `self`.
-pub fn reconstruct_tables(
+pub(crate) fn reconstruct_tables(
     tables: &[TableEntry],
     repo: &DirTrie,
     page_pool: &PagePool,
@@ -231,4 +246,90 @@ fn reconstruct_one_table_pages(
             }
         })
         .collect()
+}
+
+pub(crate) fn write_blobs<'a>(
+    repo: &DirTrie,
+    parent: Option<&DirTrie>,
+    mut on_write: impl FnMut(BlobEntry),
+    counter: &mut CountCreated,
+    blobs: impl Iterator<Item = Result<ScannedBlob<'a>, ObjectStoreError>>,
+) -> Result<(), SnapshotError> {
+    let io_error = |hash, cause| SnapshotError::WriteObject {
+        ty: ObjectType::Blob(hash),
+        dest_repo: repo.root().to_path_buf(),
+        source_repo: parent.map(|src| src.root().to_path_buf()),
+        cause,
+    };
+    for blob in blobs {
+        let blob = blob?;
+        repo.hardlink_or_write(parent, &blob.hash.data, || blob.data, counter)
+            .map_err(|e| io_error(blob.hash, e))?;
+        on_write(BlobEntry {
+            hash: blob.hash,
+            uses: blob.uses.get() as u32,
+        });
+    }
+
+    Ok(())
+}
+
+pub(crate) fn write_tables<'a>(
+    repo: &DirTrie,
+    parent: Option<&DirTrie>,
+    mut on_write: impl FnMut(TableEntry),
+    counter: &mut CountCreated,
+    tables: impl Iterator<Item = &'a mut Table>,
+) -> Result<(), SnapshotError> {
+    for table in tables {
+        let mut pages = Vec::new();
+        for page in table.iter_pages_with_hashes() {
+            let hash = match page? {
+                None => ZERO_HASH_DENOTING_ABSENT_PAGE,
+                Some((hash, page)) => {
+                    let page = page.read();
+                    debug_assert!(page.unmodified_hash().copied() == Some(hash));
+
+                    repo.hardlink_or_write(parent, hash.as_bytes(), || bsatn::to_vec(&*page).unwrap(), counter)
+                        .map_err(|cause| SnapshotError::WriteObject {
+                            ty: ObjectType::Page(hash),
+                            dest_repo: repo.root().to_path_buf(),
+                            source_repo: parent.map(|src| src.root().to_path_buf()),
+                            cause,
+                        })?;
+
+                    hash
+                }
+            };
+
+            pages.push(hash);
+        }
+
+        on_write(TableEntry {
+            table_id: table.schema.table_id,
+            pages,
+        });
+    }
+
+    Ok(())
+}
+
+pub(crate) fn write_snapshot_file(path: SnapshotFilePath, snapshot_bsatn: &[u8]) -> Result<(), SnapshotError> {
+    let hash = blake3::hash(snapshot_bsatn);
+
+    // Create the snapshot file, containing first the hash, then the `Snapshot`.
+    {
+        let mut snapshot_file = BufWriter::new(path.open_file(&o_excl())?);
+        snapshot_file.write_all(hash.as_bytes())?;
+        snapshot_file.write_all(snapshot_bsatn)?;
+        snapshot_file.flush()?;
+        // fsync file + enclosing directory.
+        snapshot_file
+            .into_inner()
+            .expect("buffered writer just flushed")
+            .sync_all()?;
+        FileOrDirPath::Dir(&path.snapshot_dir().0).sync_all()?;
+    }
+
+    Ok(())
 }

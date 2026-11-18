@@ -1,14 +1,24 @@
-use std::path::PathBuf;
+use std::{
+    collections::BTreeMap,
+    io,
+    path::{Path, PathBuf},
+};
 
 use spacetimedb_durability::TxOffset;
 use spacetimedb_fs_utils::dir_trie::{CountCreated, DirTrie};
 use spacetimedb_lib::{bsatn, Identity};
+use spacetimedb_paths::server::SnapshotDirPath;
+use spacetimedb_primitives::TableId;
 use spacetimedb_sats::{Deserialize, Serialize};
-use spacetimedb_table::{blob_store::BlobHash, page::Page, table::Table, tiered::BlobSet};
+use spacetimedb_table::{
+    page_pool::PagePool,
+    table::Table,
+    tiered::{BlobMap, ObjectKey, ObjectStoreError, ScannedBlob},
+};
 
 use crate::{
-    table_num_present_pages, table_present_pages, BlobEntry, ObjectType, SnapshotError, TableEntry,
-    ZERO_HASH_DENOTING_ABSENT_PAGE,
+    common, remote::ObjectProvider, BlobEntry, ObjectType, SnapshotError, SnapshotReadKindMetrics, TableEntry,
+    TablePages,
 };
 
 pub const SNAPSHOT_VERSION: u8 = 0;
@@ -45,149 +55,118 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Insert a single large blob from a [`BlobSet`]
-    /// into the in-memory snapshot `self`
-    /// and the on-disk object repository `object_repo`.
-    ///
-    /// If the `prev_snapshot` is supplied, this method will attempt to hardlink the blob's on-disk object
-    /// from that previous snapshot into `object_repo` rather than creating a fresh object.
-    fn write_blob(
+    pub fn objects(&self) -> impl Iterator<Item = ObjectKey> {
+        self.blobs.iter().map(|entry| ObjectKey::from(entry.hash)).chain(
+            self.tables
+                .iter()
+                .flat_map(|table| table.present_pages().map(Into::into)),
+        )
+    }
+
+    /// Obtain an iterator over the [`PathBuf`]s of all objects
+    pub fn files<'a>(&'a self, repo: &'a SnapshotRepo) -> impl Iterator<Item = (blake3::Hash, PathBuf)> + 'a {
+        self.objects().map(|key| (key.into(), repo.file_path(key)))
+    }
+
+    pub fn write_objects<'db, 'a>(
         &mut self,
-        object_repo: &DirTrie,
-        hash: &BlobHash,
-        uses: usize,
-        blob: &[u8],
-        prev_snapshot: Option<&DirTrie>,
+        repo: &SnapshotRepo,
+        parent: Option<&SnapshotDirPath>,
+        tables: impl Iterator<Item = &'db mut Table>,
+        blobs: impl Iterator<Item = Result<ScannedBlob<'a>, ObjectStoreError>>,
         counter: &mut CountCreated,
     ) -> Result<(), SnapshotError> {
-        object_repo
-            .hardlink_or_write(prev_snapshot, &hash.data, || blob, counter)
-            .map_err(|cause| SnapshotError::WriteObject {
-                ty: ObjectType::Blob(*hash),
-                dest_repo: object_repo.root().to_path_buf(),
-                source_repo: prev_snapshot.map(|dest_repo| dest_repo.root().to_path_buf()),
-                cause,
-            })?;
-        self.blobs.push(BlobEntry {
-            hash: *hash,
-            uses: uses as u32,
-        });
+        let parent = parent.map(SnapshotRepo::open).transpose()?;
+
+        let on_blob_write = |entry| self.blobs.push(entry);
+        let on_table_write = |entry| self.tables.push(entry);
+
+        common::write_blobs(
+            &repo.inner,
+            parent.as_ref().map(|repo| &repo.inner),
+            on_blob_write,
+            counter,
+            blobs,
+        )?;
+        common::write_tables(
+            &repo.inner,
+            parent.as_ref().map(|repo| &repo.inner),
+            on_table_write,
+            counter,
+            tables,
+        )?;
+
         Ok(())
     }
 
-    /// Populate the in-memory snapshot `self`,
-    /// and the on-disk object repository `object_repo`,
-    /// with all large blobs from `blobs`.
-    pub(crate) fn write_all_blobs(
-        &mut self,
-        object_repo: &DirTrie,
-        blobs: &BlobSet,
-        prev_snapshot: Option<&DirTrie>,
-        counter: &mut CountCreated,
-    ) -> Result<(), SnapshotError> {
-        blobs.try_for_each(|hash, uses, blob| {
-            self.write_blob(object_repo, &hash, uses.get(), blob, prev_snapshot, counter)
+    pub fn write_snapshot_file(self, repo: &SnapshotRepo) -> Result<(), SnapshotError> {
+        let path = repo.root.snapshot_file(self.tx_offset);
+        // Serialize and hash the in-memory `Snapshot` object.
+        let snapshot_bsatn = bsatn::to_vec(&self).map_err(|cause| SnapshotError::Serialize {
+            ty: ObjectType::Snapshot,
+            cause,
         })?;
 
-        Ok(())
+        common::write_snapshot_file(path, &snapshot_bsatn)
     }
 
-    /// Write a single `page` into the on-disk object repository `object_repo`.
-    ///
-    /// `hash` must be the content hash of `page`, and must be stored in `page.unmodified_hash()`.
-    ///
-    /// Returns the `hash` for convenient use with [`Iter::map`] in [`Self::write_table`].
-    ///
-    /// If the `prev_snapshot` is supplied, this function will attempt to hardlink the page's on-disk object
-    /// from that previous snapshot into `object_repo` rather than creating a fresh object.
-    fn write_page(
-        object_repo: &DirTrie,
-        page: &Page,
-        hash: blake3::Hash,
-        prev_snapshot: Option<&DirTrie>,
-        counter: &mut CountCreated,
-    ) -> Result<blake3::Hash, SnapshotError> {
-        debug_assert!(page.unmodified_hash().copied() == Some(hash));
-
-        object_repo
-            .hardlink_or_write(prev_snapshot, hash.as_bytes(), || bsatn::to_vec(page).unwrap(), counter)
-            .map_err(|cause| SnapshotError::WriteObject {
-                ty: ObjectType::Page(hash),
-                dest_repo: object_repo.root().to_path_buf(),
-                source_repo: prev_snapshot.map(|source_repo| source_repo.root().to_path_buf()),
-                cause,
-            })?;
-
-        Ok(hash)
-    }
-
-    /// Populate the in-memory snapshot `self`,
-    /// and the on-disk object repository `object_repo`,
-    /// with all pages from `table`.
-    fn write_table(
-        &mut self,
-        object_repo: &DirTrie,
-        table: &mut Table,
-        prev_snapshot: Option<&DirTrie>,
-        counter: &mut CountCreated,
-    ) -> Result<(), SnapshotError> {
-        let mut pages = Vec::new();
-        for page in table.iter_pages_with_hashes() {
-            let hash = match page? {
-                None => ZERO_HASH_DENOTING_ABSENT_PAGE,
-                Some((hash, page)) => Self::write_page(object_repo, &page.read(), hash, prev_snapshot, counter)?,
-            };
-
-            pages.push(hash);
-        }
-
-        self.tables.push(TableEntry {
-            table_id: table.schema.table_id,
-            pages,
-        });
-        Ok(())
-    }
-
-    /// Populate the in-memory snapshot `self`,
-    /// and the on-disk object repository `object_repo`,
-    /// with all pages from all tables in `tables`.
-    pub(crate) fn write_all_tables<'db>(
-        &mut self,
-        object_repo: &DirTrie,
-        tables: impl Iterator<Item = &'db mut Table>,
-        prev_snapshot: Option<&DirTrie>,
-        counter: &mut CountCreated,
-    ) -> Result<(), SnapshotError> {
-        for table in tables {
-            self.write_table(object_repo, table, prev_snapshot, counter)?;
-        }
-        Ok(())
-    }
-
-    /// The number of objects in this snapshot, both blobs and pages.
     pub fn total_objects(&self) -> usize {
         self.blobs.len()
             + self
                 .tables
                 .iter()
-                .map(|table| table_num_present_pages(&table.pages) as usize)
+                .map(|table| table.present_pages().count())
                 .sum::<usize>()
     }
 
-    /// Obtain an iterator over the [`blake3::Hash`]es of all objects
-    /// this snapshot is referring to.
-    pub fn objects(&self) -> impl Iterator<Item = blake3::Hash> + '_ {
-        self.blobs
-            .iter()
-            .map(|b| blake3::Hash::from_bytes(b.hash.data))
-            .chain(self.tables.iter().flat_map(|t| table_present_pages(&t.pages)))
+    pub(super) fn repo(&self, dir: &SnapshotDirPath) -> io::Result<SnapshotRepo> {
+        SnapshotRepo::open(dir)
+    }
+}
+
+pub struct SnapshotRepo {
+    root: SnapshotDirPath,
+    inner: DirTrie,
+}
+
+impl SnapshotRepo {
+    pub fn open(dir: &SnapshotDirPath) -> io::Result<Self> {
+        DirTrie::open(dir.objects().0).map(|inner| Self {
+            root: dir.clone(),
+            inner,
+        })
     }
 
-    /// Obtain an iterator over the [`PathBuf`]s of all objects
-    pub fn files<'a>(&'a self, src_repo: &'a DirTrie) -> impl Iterator<Item = (blake3::Hash, PathBuf)> + 'a {
-        self.objects().map(move |hash| {
-            let path = src_repo.file_path(hash.as_bytes());
-            (hash, path)
-        })
+    pub fn root(&self) -> &Path {
+        self.inner.root()
+    }
+
+    pub fn reconstruct_blobs(
+        &self,
+        manifest: &Snapshot,
+        metrics: &mut SnapshotReadKindMetrics,
+    ) -> Result<BlobMap, SnapshotError> {
+        common::reconstruct_blob_store(&manifest.blobs, &self.inner, metrics)
+    }
+
+    pub fn reconstruct_tables(
+        &self,
+        manifest: &Snapshot,
+        page_pool: &PagePool,
+        metrics: &mut SnapshotReadKindMetrics,
+    ) -> Result<BTreeMap<TableId, TablePages>, SnapshotError> {
+        common::reconstruct_tables(&manifest.tables, &self.inner, page_pool, metrics)
+    }
+
+    pub fn file_path(&self, key: ObjectKey) -> PathBuf {
+        self.inner.file_path(key.as_bytes())
+    }
+}
+
+impl ObjectProvider for SnapshotRepo {
+    type Reader = <DirTrie as ObjectProvider>::Reader;
+
+    fn object_reader(&self, key: ObjectKey) -> impl Future<Output = io::Result<Self::Reader>> + Send {
+        self.inner.object_reader(key)
     }
 }
