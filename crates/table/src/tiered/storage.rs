@@ -618,6 +618,45 @@ impl TieredStorage {
         Err(not_found(key))
     }
 
+    pub(crate) fn ensure_local_tier(&self, object: &mut DiskObject) -> Result<(), ObjectStoreError> {
+        let key = object.key;
+        let slot = self.catalog.read().get(&key).cloned().ok_or_else(|| unknown(key))?;
+        // Ensure the object can't be evicted.
+        object.pin();
+        // Object is already in the local tier.
+        if self.local.object_store.stat(key)?.is_some() {
+            return Ok(());
+        }
+
+        let Some(remote) = &self.remote else {
+            return Err(ObjectStoreError::RemoteDisabled);
+        };
+
+        let ObjectMetadata { size } = remote.object_store.stat(key)?.ok_or_else(|| not_found(key))?;
+        // Acquire the permit before locking the slot, as eviction may lock
+        // it, too.
+        let permit = self.acquire_local_permit(size)?;
+
+        let mut state = slot.state.lock();
+        let entry = state.object.as_mut().ok_or_else(|| unknown(key))?;
+        // Another reader or writer may have restored the object while we
+        // reserved space.
+        if self.local.object_store.stat(key)?.is_some() {
+            return Ok(());
+        }
+
+        // Fetch the remote object and store it locally.
+        // Hold the entry lock to prevent eviction.
+        let bytes = remote.object_store.read(key)?.ok_or_else(|| not_found(key))?;
+        self.local
+            .object_store
+            .write(object_from_trusted_bytes(key, bytes.clone()))?;
+        entry.last_access_epoch = self.access_epoch();
+        entry.permit = Some(permit);
+
+        Ok(())
+    }
+
     /// Trim the local storage to the configured low watermark.
     ///
     /// See also: [Self::evict].
